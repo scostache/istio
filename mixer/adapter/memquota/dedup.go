@@ -58,7 +58,7 @@ const (
 )
 
 // handleDedup is a wrapper function that handles dedupping semantics.
-func (du *dedupUtil) handleDedup(instance *quota.Instance, args adapter.QuotaArgs, qf quotaFunc) (int64, time.Duration, string, error) {
+func (du *dedupUtil) handleDedup(instance *quota.Instance, args adapter.QuotaArgs, qf quotaFunc) (int64, time.Duration, string) {
 	key := makeKey(instance.Name, instance.Dimensions)
 
 	du.Lock()
@@ -92,7 +92,7 @@ func (du *dedupUtil) handleDedup(instance *quota.Instance, args adapter.QuotaArg
 		du.logger.Infof("Quota operation satisfied through deduplication: dedupID %v, amount %v", args.DeduplicationID, result.amount)
 	}
 
-	return amount, exp, key, nil
+	return amount, exp, key
 }
 
 // reapDedup cleans up dedup entries from the oldDedup map and moves all entries from
@@ -105,8 +105,8 @@ func (du *dedupUtil) reapDedup() {
 	du.oldDedup = du.recentDedup
 	du.recentDedup = t
 
-	if len(t) > 0 && du.logger.VerbosityLevel(4) {
-		du.logger.Infof("Running repear to reclaim %d old deduplication entries", len(t))
+	if len(t) > 0 {
+		du.logger.Debugf("Running repear to reclaim %d old deduplication entries", len(t))
 	}
 
 	// TODO: why isn't there a O(1) way to clear a map to the empty state?!

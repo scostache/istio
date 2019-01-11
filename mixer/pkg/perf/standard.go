@@ -14,40 +14,37 @@
 
 package perf
 
-import "istio.io/api/mixer/v1"
+import (
+	istio_mixer_v1 "istio.io/api/mixer/v1"
+)
 
 // This file contains sample data sets to simplify the tests.
 
 // MinimalConfig is a very basic configuration, mainly useful for testing the perf infrastructure itself,
 var MinimalConfig = Config{
-	Service:                 minimalSvcCfg,
-	Global:                  minimalGlobalCfg,
-	IdentityAttribute:       `destination.rpcServer`,
-	IdentityAttributeDomain: `svc.cluster.local`,
+	Service: minimalSvcCfg,
+	Global:  minimalGlobalCfg,
 }
 
 // MinimalSetup is a very basic setup, mainly useful for testing the perf infrastructure itself.
 var MinimalSetup = Setup{
 	Config: MinimalConfig,
-	Load: Load{
+	Loads: []Load{{
 		Multiplier:  100,
 		StableOrder: false,
 		Requests: []Request{
 
-			BasicReport{
-				Attributes: map[string]interface{}{
-					"foo": "bar",
-					"baz": 42,
-				},
-			},
+			BuildBasicReport(map[string]interface{}{
+				"foo": "bar",
+				"baz": int64(42),
+			}),
 
-			BasicCheck{
-				Attributes: map[string]interface{}{
+			BuildBasicCheck(
+				map[string]interface{}{
 					"bar": "baz",
-					"foo": 23,
+					"foo": int64(23),
 				},
-
-				Quotas: map[string]istio_mixer_v1.CheckRequest_QuotaParams{
+				map[string]istio_mixer_v1.CheckRequest_QuotaParams{
 					"q1": {
 						Amount:     23,
 						BestEffort: true,
@@ -56,10 +53,9 @@ var MinimalSetup = Setup{
 						Amount:     54,
 						BestEffort: false,
 					},
-				},
-			},
+				}),
 		},
-	},
+	}},
 }
 
 const (
@@ -73,7 +69,7 @@ spec:
     attributes:
       source.name:
         value_type: STRING
-      target.name:
+      destination.name:
         value_type: STRING
       response.count:
         value_type: INT64
@@ -106,7 +102,7 @@ spec:
   value: "2"
   dimensions:
     source: source.name | "mysrc"
-    target_ip: target.name | "mytarget"
+    target_ip: destination.name | "mytarget"
 
 ---
 
@@ -116,7 +112,7 @@ metadata:
   name: rule1
   namespace: istio-system
 spec:
-  selector: match(target.name, "*")
+  selector: match(destination.name, "*")
   actions:
   - handler: fakeHandlerConfig.fakeHandler
     instances:

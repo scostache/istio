@@ -23,15 +23,16 @@ import (
 	"text/tabwriter"
 	"time"
 
-	rpc "github.com/googleapis/googleapis/google/rpc"
+	rpc "github.com/gogo/googleapis/google/rpc"
 	otgrpc "github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	ot "github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/status"
 
 	mixerpb "istio.io/api/mixer/v1"
 	"istio.io/istio/mixer/cmd/shared"
 	"istio.io/istio/mixer/pkg/attribute"
-	"istio.io/istio/mixer/pkg/tracing"
+	"istio.io/istio/pkg/tracing"
 )
 
 type clientState struct {
@@ -39,18 +40,19 @@ type clientState struct {
 	connection *grpc.ClientConn
 }
 
-func createAPIClient(port string, enableTracing bool) (*clientState, error) {
+func createAPIClient(port string, tracingOptions *tracing.Options) (*clientState, error) {
 	cs := clientState{}
 
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithInsecure())
-	if enableTracing {
-		t, _, err := tracing.NewTracer("mixer-client", tracing.WithLogger())
+
+	if tracingOptions.TracingEnabled() {
+		_, err := tracing.Configure("mixer-client", tracingOptions)
 		if err != nil {
 			return nil, fmt.Errorf("could not build tracer: %v", err)
 		}
-		ot.InitGlobalTracer(t)
-		opts = append(opts, grpc.WithUnaryInterceptor(otgrpc.OpenTracingClientInterceptor(t)))
+		ot.InitGlobalTracer(ot.GlobalTracer())
+		opts = append(opts, grpc.WithUnaryInterceptor(otgrpc.OpenTracingClientInterceptor(ot.GlobalTracer())))
 	}
 
 	var err error
@@ -63,10 +65,6 @@ func createAPIClient(port string, enableTracing bool) (*clientState, error) {
 }
 
 func deleteAPIClient(cs *clientState) {
-	// TODO: This is to compensate for this bug: https://github.com/grpc/grpc-go/issues/1059
-	//       Remove this delay once that bug is fixed.
-	time.Sleep(50 * time.Millisecond)
-
 	_ = cs.connection.Close()
 	cs.client = nil
 	cs.connection = nil
@@ -108,7 +106,7 @@ func parseBytes(s string) (interface{}, error) {
 }
 
 func parseStringMap(s string) (interface{}, error) {
-	m := make(map[string]string)
+	m := attribute.NewStringMap("")
 	for _, pair := range strings.Split(s, ";") {
 		colon := strings.Index(pair, ":")
 		if colon < 0 {
@@ -117,7 +115,7 @@ func parseStringMap(s string) (interface{}, error) {
 
 		k := pair[0:colon]
 		v := pair[colon+1:]
-		m[k] = v
+		m.Set(k, v)
 	}
 
 	return m, nil
@@ -145,7 +143,7 @@ func parseAny(s string) (interface{}, error) {
 
 type convertFn func(string) (interface{}, error)
 
-func process(b *attribute.MutableBag, s string, f convertFn) error {
+func process(b *attribute.MutableBag, dict *map[string]int32, s string, f convertFn) error {
 	if len(s) > 0 {
 		for _, seg := range strings.Split(s, ",") {
 			eq := strings.Index(seg, "=")
@@ -166,61 +164,70 @@ func process(b *attribute.MutableBag, s string, f convertFn) error {
 
 			// add to results
 			b.Set(name, nv)
+			(*dict)[name] = int32(len(*dict))
 		}
 	}
 
 	return nil
 }
 
-func parseAttributes(rootArgs *rootArgs) (*mixerpb.CompressedAttributes, error) {
+func parseAttributes(rootArgs *rootArgs) (*mixerpb.CompressedAttributes, []string, error) {
 	b := attribute.GetMutableBag(nil)
-
-	if err := process(b, rootArgs.stringAttributes, parseString); err != nil {
-		return nil, err
+	gb := make(map[string]int32)
+	if err := process(b, &gb, rootArgs.stringAttributes, parseString); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.int64Attributes, parseInt64); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.int64Attributes, parseInt64); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.doubleAttributes, parseFloat64); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.doubleAttributes, parseFloat64); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.boolAttributes, parseBool); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.boolAttributes, parseBool); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.timestampAttributes, parseTime); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.timestampAttributes, parseTime); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.durationAttributes, parseDuration); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.durationAttributes, parseDuration); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.bytesAttributes, parseBytes); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.bytesAttributes, parseBytes); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.stringMapAttributes, parseStringMap); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.stringMapAttributes, parseStringMap); err != nil {
+		return nil, nil, err
 	}
 
-	if err := process(b, rootArgs.attributes, parseAny); err != nil {
-		return nil, err
+	if err := process(b, &gb, rootArgs.attributes, parseAny); err != nil {
+		return nil, nil, err
 	}
 
 	var attrs mixerpb.CompressedAttributes
 	b.ToProto(&attrs, nil, 0)
 
-	return &attrs, nil
+	dw := make([]string, len(gb), len(gb))
+	for k, v := range gb {
+		dw[v] = k
+	}
+	return &attrs, dw, nil
 }
 
 func decodeError(err error) string {
-	result := grpc.Code(err).String()
+	st, ok := status.FromError(err)
+	if !ok {
+		return "unknown"
+	}
+	result := st.Code().String()
 
-	msg := grpc.ErrorDesc(err)
+	msg := st.Message()
 	if msg != "" {
 		result = result + " (" + msg + ")"
 	}
@@ -241,6 +248,7 @@ func decodeStatus(status rpc.Status) string {
 	return result
 }
 
+// nolint:deadcode
 func dumpAttributes(printf, fatalf shared.FormatFn, attrs *mixerpb.CompressedAttributes) {
 	if attrs == nil {
 		return
@@ -272,7 +280,7 @@ func dumpAttributes(printf, fatalf shared.FormatFn, attrs *mixerpb.CompressedAtt
 	printf("%s", buf.String())
 }
 
-func dumpReferencedAttributes(printf, fatalf shared.FormatFn, attrs *mixerpb.ReferencedAttributes) {
+func dumpReferencedAttributes(printf shared.FormatFn, attrs *mixerpb.ReferencedAttributes) {
 	vals := make([]string, 0, len(attrs.AttributeMatches))
 	for _, at := range attrs.AttributeMatches {
 		out := attrs.Words[-1*at.Name-1]

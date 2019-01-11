@@ -16,35 +16,57 @@ package server
 
 import (
 	"testing"
+
+	"istio.io/istio/mixer/pkg/config/store"
 )
 
 func TestValidation(t *testing.T) {
-	a := NewArgs()
+	a := DefaultArgs()
 
 	if err := a.validate(); err != nil {
 		t.Errorf("Expecting to validate but failed with: %v", err)
 	}
 
+	a = DefaultArgs()
+	a.MaxMessageSize = 0
+	if err := a.validate(); err == nil {
+		t.Errorf("Got unexpected success")
+	}
+
+	a = DefaultArgs()
+	a.MaxConcurrentStreams = 0
+	if err := a.validate(); err == nil {
+		t.Errorf("Got unexpected success")
+	}
+
+	a = DefaultArgs()
 	a.AdapterWorkerPoolSize = -1
 	if err := a.validate(); err == nil {
 		t.Errorf("Got unexpected success")
 	}
 
-	a = NewArgs()
+	a = DefaultArgs()
 	a.APIWorkerPoolSize = -1
 	if err := a.validate(); err == nil {
 		t.Errorf("Got unexpected success")
 	}
 
-	a = NewArgs()
-	a.ExpressionEvalCacheSize = -1
+	a = DefaultArgs()
+	a.NumCheckCacheEntries = -1
+	if err := a.validate(); err == nil {
+		t.Errorf("Got unexpected success")
+	}
+
+	a = DefaultArgs()
+	a.ConfigStore = store.WithBackend(nil)
+	a.ConfigStoreURL = "k8s://"
 	if err := a.validate(); err == nil {
 		t.Errorf("Got unexpected success")
 	}
 }
 
 func TestString(t *testing.T) {
-	a := NewArgs()
+	a := DefaultArgs()
 
 	// just make sure this doesn't crash
 	s := a.String()

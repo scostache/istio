@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
+	rpc "github.com/gogo/googleapis/google/rpc"
 	pbtypes "github.com/gogo/protobuf/types"
-	rpc "github.com/googleapis/googleapis/google/rpc"
 	"google.golang.org/api/googleapi"
 	sc "google.golang.org/api/servicecontrol/v1"
 
@@ -63,10 +63,7 @@ func checkProcessorTestSetup(t *testing.T) *checkProcessorTest {
 		mockClient: &mockSvcctrlClient{},
 	}
 
-	ctx, err := initializeHandlerContext(at.NewEnv(t), &test.testConfig, test.mockClient)
-	if err != nil {
-		t.Fatalf(`fail to initialize handleContext %v`, err)
-	}
+	ctx := initializeHandlerContext(at.NewEnv(t), &test.testConfig, test.mockClient)
 
 	checkProc, err := newCheckProcessor(meshServiceName, ctx)
 	if err != nil {

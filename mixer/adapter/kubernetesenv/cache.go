@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors.
+// Copyright 2017 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package kubernetes
+package kubernetesenv
 
 import (
 	"errors"
-	"reflect"
-	"sync"
+	"fmt"
+	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
@@ -34,233 +34,150 @@ type (
 	// internal interface used to support testing
 	cacheController interface {
 		Run(<-chan struct{})
-		GetPod(string) (*v1.Pod, bool)
+		Pod(string) (*v1.Pod, bool)
+		Workload(*v1.Pod) (workload, bool)
 		HasSynced() bool
+		StopControlChannel()
 	}
 
 	controllerImpl struct {
-		clientset     kubernetes.Interface
-		env           adapter.Env
-		pods          cache.SharedInformer
-		mutationsChan chan resourceMutation
-
-		ipPodMap      map[string]string
-		ipPodMapMutex *sync.RWMutex
+		env      adapter.Env
+		stopChan chan struct{}
+		pods     cache.SharedIndexInformer
+		rs       cache.SharedIndexInformer
+		rc       cache.SharedIndexInformer
 	}
 
-	// used to send updates to the logger
-	resourceMutation struct {
-		kind eventType
-		obj  interface{}
+	workload struct {
+		uid, name, namespace string
+		selfLinkURL          string
 	}
-
-	eventType int
 )
 
-const (
-	addition eventType = iota
-	update
-	deletion
-)
-
-// mutationBufferSize sets the limit on how many mutation events can be
-// outstanding at any moment. 100 is chosen as a reasonable default to start.
-// TODO: make this configurable
-const mutationBufferSize = 100
-
-// errorDelay controls how long the logger waits when encountering an error
-// during logging. This should only ever happen when the underlying cache has
-// not yet synced (at which point we need to wait before doing any further
-// processing).
-// TODO: make this configurable
-const errorDelay = 1 * time.Second
-
-const debugVerbosityLevel = 4
+func podIP(obj interface{}) ([]string, error) {
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		return nil, errors.New("object is not a pod")
+	}
+	ip := pod.Status.PodIP
+	if ip == "" {
+		return nil, nil
+	}
+	return []string{ip}, nil
+}
 
 // Responsible for setting up the cacheController, based on the supplied client.
-// It configures the index informer to list/watch pods and send update events
+// It configures the index informer to list/watch k8sCache and send update events
 // to a mutations channel for processing (in this case, logging).
-func newCacheController(clientset *kubernetes.Clientset, refreshDuration time.Duration, env adapter.Env) cacheController {
-	c := &controllerImpl{
-		clientset:     clientset,
-		env:           env,
-		mutationsChan: make(chan resourceMutation, mutationBufferSize),
-		ipPodMapMutex: &sync.RWMutex{},
-		ipPodMap:      make(map[string]string),
-	}
-
-	namespace := "" // todo: address unparam linter issue
-
-	c.pods = cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
-				return clientset.Pods(namespace).List(opts)
-			},
-			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
-				return clientset.Pods(namespace).Watch(opts)
-			},
-		},
-		&v1.Pod{},
-		refreshDuration,
-		cache.Indexers{},
-	)
-
-	c.pods.AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc:    c.updateIPPodMap,
-			DeleteFunc: c.deleteFromIPPodMap,
-			UpdateFunc: func(old, cur interface{}) {
-				if !reflect.DeepEqual(old, cur) {
-					c.updateIPPodMap(cur)
-				}
-			},
-		},
-	)
-
-	// debug logging for pod update events
-	if env.Logger().VerbosityLevel(debugVerbosityLevel) {
-		c.pods.AddEventHandler(
-			cache.ResourceEventHandlerFuncs{
-				AddFunc: func(obj interface{}) {
-					c.mutationsChan <- resourceMutation{addition, obj}
-				},
-				DeleteFunc: func(obj interface{}) {
-					c.mutationsChan <- resourceMutation{deletion, obj}
-				},
-				UpdateFunc: func(old, cur interface{}) {
-					if !reflect.DeepEqual(old, cur) {
-						c.mutationsChan <- resourceMutation{update, cur}
-					}
-				},
-			},
-		)
-	}
-
-	return c
-}
-
-// Run starts the logger and the controller for the pod cache.
-func (c *controllerImpl) Run(stop <-chan struct{}) {
-	if c.env.Logger().VerbosityLevel(debugVerbosityLevel) {
-		c.env.ScheduleDaemon(func() {
-			c.runLogger(stop)
-		})
-	}
-	c.env.ScheduleDaemon(func() {
-		c.pods.Run(stop)
-		c.env.Logger().Infof("pod cache started")
+func newCacheController(clientset kubernetes.Interface, refreshDuration time.Duration, env adapter.Env, stopChan chan struct{}) cacheController {
+	sharedInformers := informers.NewSharedInformerFactory(clientset, refreshDuration)
+	podInformer := sharedInformers.Core().V1().Pods().Informer()
+	podInformer.AddIndexers(cache.Indexers{
+		"ip": podIP,
 	})
-	<-stop
-	c.env.Logger().Infof("cluster cache updating terminated")
+
+	return &controllerImpl{
+		env:      env,
+		stopChan: stopChan,
+		pods:     podInformer,
+		rs:       sharedInformers.Apps().V1().ReplicaSets().Informer(),
+		rc:       sharedInformers.Core().V1().ReplicationControllers().Informer(),
+	}
 }
 
-// runLogger is responsible for pulling event updates off of the mutations
-// channel and logging them via the configured logger.
-func (c *controllerImpl) runLogger(stop <-chan struct{}) {
-	for {
-		select {
-		case mutation := <-c.mutationsChan:
-			err := c.log(mutation.obj, mutation.kind)
-			if err != nil {
-				c.env.Logger().Infof("event logging failed, will retry: %v", err)
-				select {
-				case <-stop:
-					c.env.Logger().Infof("cluster cache logging worker terminated")
-					return
-				case <-time.After(errorDelay):
-					// used to wait out errors
-					// time.After is OK for usage as there
-					// is no real concern here over the
-					// slight delay in GC that may occur
-					// if a stop message is received before
-					// this timer fires.
-				}
-			}
-		case <-stop:
-			c.env.Logger().Infof("cluster cache logging worker terminated")
-			return
-		}
-	}
+func (c *controllerImpl) StopControlChannel() {
+	close(c.stopChan)
 }
 
 func (c *controllerImpl) HasSynced() bool {
-	return c.pods.HasSynced()
+	if c.pods.HasSynced() && c.rs.HasSynced() && c.rc.HasSynced() {
+		return true
+	}
+	return false
 }
 
-// log is used to record all updates to a cache.
-func (c *controllerImpl) log(obj interface{}, kind eventType) error {
-	if !c.HasSynced() {
-		// should only happen before an initial listing has completed
-		return errors.New("resource sync has yet not completed")
-	}
-	k, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-	if err != nil {
-		c.env.Logger().Infof("could not retrieve key for object: %v", err)
-		return nil
-	}
-	c.env.Logger().Infof("%s object with key: '%#v'", kind, k)
-	return nil
+func (c *controllerImpl) Run(stop <-chan struct{}) {
+	// TODO: scheduledaemon
+	c.env.ScheduleDaemon(func() { c.pods.Run(stop) })
+	c.env.ScheduleDaemon(func() { c.rs.Run(stop) })
+	c.env.ScheduleDaemon(func() { c.rc.Run(stop) })
+	<-stop
+	// TODO: logging?
 }
 
-// GetPod returns a Pod object that corresponds to the supplied key, if one
+// Pod returns a k8s Pod object that corresponds to the supplied key, if one
 // exists (and is known to the store). Keys are expected in the form of:
 // namespace/name or IP address (example: "default/curl-2421989462-b2g2d.default").
-func (c *controllerImpl) GetPod(podKey string) (*v1.Pod, bool) {
-	c.ipPodMapMutex.RLock()
-	key, exists := c.ipPodMap[podKey]
-	c.ipPodMapMutex.RUnlock()
-	if !exists {
-		key = podKey
+func (c *controllerImpl) Pod(podKey string) (*v1.Pod, bool) {
+	indexer := c.pods.GetIndexer()
+	objs, err := indexer.ByIndex("ip", podKey)
+	if err != nil {
+		return nil, false
 	}
-	item, exists, err := c.pods.GetStore().GetByKey(key)
+	if len(objs) > 0 {
+		pod, ok := objs[0].(*v1.Pod)
+		if !ok {
+			return nil, false
+		}
+		return pod, true
+	}
+	item, exists, err := indexer.GetByKey(podKey)
 	if !exists || err != nil {
 		return nil, false
 	}
 	return item.(*v1.Pod), true
 }
 
-func (e eventType) String() string {
-	switch e {
-	case addition:
-		return "Add"
-	case deletion:
-		return "Delete"
-	case update:
-		return "Update"
-	default:
-		return "Unknown"
-	}
-}
-
-func (c *controllerImpl) updateIPPodMap(obj interface{}) {
-	pod, ok := obj.(*v1.Pod)
-	if !ok {
-		c.env.Logger().Warningf("received update for non-pod item")
-		return
-	}
-	ip := pod.Status.PodIP
-
-	if len(ip) > 0 {
-		c.ipPodMapMutex.Lock()
-		c.ipPodMap[ip] = key(pod.Namespace, pod.Name)
-		c.ipPodMapMutex.Unlock()
-	}
-}
-
-func (c *controllerImpl) deleteFromIPPodMap(obj interface{}) {
-	pod, ok := obj.(*v1.Pod)
-	if !ok {
-		c.env.Logger().Warningf("received update for non-pod item")
-		return
-	}
-	ip := pod.Status.PodIP
-	if len(ip) > 0 {
-		c.ipPodMapMutex.Lock()
-		delete(c.ipPodMap, ip)
-		c.ipPodMapMutex.Unlock()
-	}
-}
-
 func key(namespace, name string) string {
 	return namespace + "/" + name
+}
+
+func (c *controllerImpl) Workload(pod *v1.Pod) (workload, bool) {
+	wl := workload{name: pod.Name, namespace: pod.Namespace, selfLinkURL: pod.SelfLink}
+	if owner, found := c.rootController(&pod.ObjectMeta); found {
+		wl.name = owner.Name
+		wl.selfLinkURL = fmt.Sprintf("kubernetes://apis/%s/namespaces/%s/%ss/%s", owner.APIVersion, pod.Namespace, strings.ToLower(owner.Kind), owner.Name)
+	}
+	wl.uid = "istio://" + wl.namespace + "/workloads/" + wl.name
+	return wl, true
+}
+
+func (c *controllerImpl) rootController(obj *metav1.ObjectMeta) (metav1.OwnerReference, bool) {
+	for _, ref := range obj.OwnerReferences {
+		if *ref.Controller {
+			switch ref.Kind {
+			case "ReplicaSet":
+				indexer := c.rs.GetIndexer()
+				if rs, found := c.objectMeta(indexer, key(obj.Namespace, ref.Name)); found {
+					if rootRef, ok := c.rootController(rs); ok {
+						return rootRef, true
+					}
+				}
+			case "ReplicationController":
+				indexer := c.rc.GetIndexer()
+				if rc, found := c.objectMeta(indexer, key(obj.Namespace, ref.Name)); found {
+					if rootRef, ok := c.rootController(rc); ok {
+						return rootRef, true
+					}
+				}
+			}
+
+			return ref, true
+		}
+	}
+	return metav1.OwnerReference{}, false
+}
+
+func (c *controllerImpl) objectMeta(keyGetter cache.KeyGetter, key string) (*metav1.ObjectMeta, bool) {
+	item, exists, err := keyGetter.GetByKey(key)
+	if !exists || err != nil {
+		return nil, false
+	}
+	switch v := item.(type) {
+	case *v1.ReplicationController:
+		return &v.ObjectMeta, true
+	case *appsv1.ReplicaSet:
+		return &v.ObjectMeta, true
+	}
+	return nil, false
 }

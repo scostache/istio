@@ -1,4 +1,4 @@
-// Copyright 2017 Google Ina.
+// Copyright 2017 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55,10 +55,8 @@ func parseRegexList(buf []byte, overrides []string) (*regexList, error) {
 	}
 
 	for _, override := range overrides {
-		exp, err := regexp.Compile(override)
-		if err != nil {
-			return nil, err
-		}
+		// cannot fail, override syntax was checked in the Validate method
+		exp, _ := regexp.Compile(override)
 		entries = append(entries, exp)
 	}
 	return &regexList{entries}, nil

@@ -16,26 +16,39 @@ package server
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
-	"path"
+	"strings"
+	"time"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/gogo/protobuf/proto"
+	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
+	ot "github.com/opentracing/opentracing-go"
+	oprometheus "github.com/prometheus/client_golang/prometheus"
+	"go.opencensus.io/exporter/prometheus"
+	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/stats/view"
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	mixerpb "istio.io/api/mixer/v1"
 	"istio.io/istio/mixer/pkg/adapter"
 	"istio.io/istio/mixer/pkg/api"
+	"istio.io/istio/mixer/pkg/checkcache"
 	"istio.io/istio/mixer/pkg/config"
+	"istio.io/istio/mixer/pkg/config/crd"
 	"istio.io/istio/mixer/pkg/config/store"
-	"istio.io/istio/mixer/pkg/expr"
-	"istio.io/istio/mixer/pkg/il/evaluator"
+	"istio.io/istio/mixer/pkg/loadshedding"
 	"istio.io/istio/mixer/pkg/pool"
-	mixerRuntime "istio.io/istio/mixer/pkg/runtime"
+	"istio.io/istio/mixer/pkg/runtime"
+	runtimeconfig "istio.io/istio/mixer/pkg/runtime/config"
+	"istio.io/istio/mixer/pkg/runtime/dispatcher"
 	"istio.io/istio/mixer/pkg/template"
+	"istio.io/istio/pkg/ctrlz"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/probe"
+	"istio.io/istio/pkg/tracing"
 )
 
 // Server is an in-memory Mixer service.
@@ -46,156 +59,235 @@ type Server struct {
 	adapterGP *pool.GoroutinePool
 	listener  net.Listener
 	monitor   *monitor
-	tracer    *mixerTracer
-	configDir string
+	tracer    io.Closer
+
+	checkCache *checkcache.Cache
+	dispatcher dispatcher.Dispatcher
+	controlZ   *ctrlz.Server
+
+	// probes
+	livenessProbe  probe.Controller
+	readinessProbe probe.Controller
+	*probe.Probe
 }
+
+type listenFunc func(network string, address string) (net.Listener, error)
 
 // replaceable set of functions for fault injection
 type patchTable struct {
-	newILEvaluator func(cacheSize int) (*evaluator.IL, error)
-	newStore2      func(r2 *store.Registry2, configURL string) (store.Store2, error)
-	newRuntime     func(eval expr.Evaluator, typeChecker expr.TypeChecker, vocab mixerRuntime.VocabularyChangeListener,
-		gp *pool.GoroutinePool, handlerPool *pool.GoroutinePool,
-		identityAttribute string, defaultConfigNamespace string, s store.Store2, adapterInfo map[string]*adapter.Info,
-		templateInfo map[string]template.Info) (mixerRuntime.Dispatcher, error)
-	startTracer  func(zipkinURL string, jaegerURL string, logTraceSpans bool) (*mixerTracer, grpc.UnaryServerInterceptor, error)
-	startMonitor func(port uint16) (*monitor, error)
-	listen       func(network string, address string) (net.Listener, error)
+	newRuntime func(s store.Store, templates map[string]*template.Info, adapters map[string]*adapter.Info,
+		defaultConfigNamespace string, executorPool *pool.GoroutinePool,
+		handlerPool *pool.GoroutinePool, enableTracing bool) *runtime.Runtime
+	configTracing func(serviceName string, options *tracing.Options) (io.Closer, error)
+	startMonitor  func(port uint16, enableProfiling bool, lf listenFunc) (*monitor, error)
+	listen        listenFunc
+	configLog     func(options *log.Options) error
+	runtimeListen func(runtime *runtime.Runtime) error
+	remove        func(name string) error
+
+	// monitoring-related setup
+	newOpenCensusExporter   func() (view.Exporter, error)
+	registerOpenCensusViews func(...*view.View) error
 }
 
 // New instantiates a fully functional Mixer server, ready for traffic.
 func New(a *Args) (*Server, error) {
-	return new(a, newPatchTable())
+	return newServer(a, newPatchTable())
 }
 
 func newPatchTable() *patchTable {
 	return &patchTable{
-		newILEvaluator: evaluator.NewILEvaluator,
-		newStore2:      func(r2 *store.Registry2, configURL string) (store.Store2, error) { return r2.NewStore2(configURL) },
-		newRuntime:     mixerRuntime.New,
-		startTracer:    startTracer,
-		startMonitor:   startMonitor,
-		listen:         net.Listen,
+		newRuntime:    runtime.New,
+		configTracing: tracing.Configure,
+		startMonitor:  startMonitor,
+		listen:        net.Listen,
+		configLog:     log.Configure,
+		runtimeListen: func(rt *runtime.Runtime) error { return rt.StartListening() },
+		remove:        os.Remove,
+		newOpenCensusExporter: func() (view.Exporter, error) {
+			return prometheus.NewExporter(prometheus.Options{Registry: oprometheus.DefaultRegisterer.(*oprometheus.Registry)})
+		},
+		registerOpenCensusViews: view.Register,
 	}
 }
 
-func new(a *Args, p *patchTable) (*Server, error) {
+func newServer(a *Args, p *patchTable) (server *Server, err error) {
 	if err := a.validate(); err != nil {
 		return nil, err
 	}
 
-	if err := log.Configure(a.LoggingOptions); err != nil {
+	if err := p.configLog(a.LoggingOptions); err != nil {
 		return nil, err
 	}
 
-	eval, err := p.newILEvaluator(a.ExpressionEvalCacheSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create IL expression evaluator with cache size %d: %v", a.ExpressionEvalCacheSize, err)
-	}
-
-	apiPoolSize := a.APIWorkerPoolSize
-	adapterPoolSize := a.AdapterWorkerPoolSize
-
 	s := &Server{}
-	s.gp = pool.NewGoroutinePool(apiPoolSize, a.SingleThreaded)
-	s.gp.AddWorkers(apiPoolSize)
 
-	s.adapterGP = pool.NewGoroutinePool(adapterPoolSize, a.SingleThreaded)
-	s.adapterGP.AddWorkers(adapterPoolSize)
+	defer func() {
+		// If return with error, need to close the server.
+		if err != nil {
+			_ = s.Close()
+		}
+	}()
+
+	s.gp = pool.NewGoroutinePool(a.APIWorkerPoolSize, a.SingleThreaded)
+	s.gp.AddWorkers(a.APIWorkerPoolSize - 1)
+
+	s.adapterGP = pool.NewGoroutinePool(a.AdapterWorkerPoolSize, a.SingleThreaded)
+	s.adapterGP.AddWorkers(a.AdapterWorkerPoolSize - 1)
 
 	tmplRepo := template.NewRepository(a.Templates)
 	adapterMap := config.AdapterInfoMap(a.Adapters, tmplRepo.SupportsTemplate)
+
+	s.Probe = probe.NewProbe()
 
 	// construct the gRPC options
 
 	var grpcOptions []grpc.ServerOption
 	grpcOptions = append(grpcOptions, grpc.MaxConcurrentStreams(uint32(a.MaxConcurrentStreams)))
-	grpcOptions = append(grpcOptions, grpc.MaxMsgSize(int(a.MaxMessageSize)))
+	grpcOptions = append(grpcOptions, grpc.MaxRecvMsgSize(int(a.MaxMessageSize)))
 
-	var interceptors []grpc.UnaryServerInterceptor
-
-	var interceptor grpc.UnaryServerInterceptor
-
-	if s.tracer, interceptor, err = p.startTracer(a.ZipkinURL, a.JaegerURL, a.LogTraceSpans); err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("unable to setup ZipKin: %v", err)
-	}
-	if interceptor != nil {
-		interceptors = append(interceptors, interceptor)
-	}
-
-	// setup server prometheus monitoring (as final interceptor in chain)
-	interceptors = append(interceptors, grpc_prometheus.UnaryServerInterceptor)
-	grpc_prometheus.EnableHandlingTimeHistogram()
-	grpcOptions = append(grpcOptions, grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(interceptors...)))
-
-	if s.monitor, err = p.startMonitor(a.MonitoringPort); err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("unable to setup monitoring: %v", err)
+	if a.TracingOptions.TracingEnabled() {
+		s.tracer, err = p.configTracing("istio-mixer", a.TracingOptions)
+		if err != nil {
+			return nil, fmt.Errorf("unable to setup tracing")
+		}
+		grpcOptions = append(grpcOptions, grpc.UnaryInterceptor(otgrpc.OpenTracingServerInterceptor(ot.GlobalTracer())))
 	}
 
 	// get the network stuff setup
-	if s.listener, err = p.listen("tcp", fmt.Sprintf(":%d", a.APIPort)); err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("unable to listen on socket: %v", err)
-	}
+	network, address := extractNetAddress(a.APIPort, a.APIAddress)
 
-	configStore2URL := a.ConfigStore2URL
-	if configStore2URL == "" {
-		configStore2URL = "k8s://"
-	}
-
-	if a.ServiceConfig != "" || a.GlobalConfig != "" {
-		if s.configDir, err = serializeConfigs(a.GlobalConfig, a.ServiceConfig); err != nil {
-			_ = s.Close()
-			return nil, fmt.Errorf("unable to serialize supplied configuration state: %v", err)
+	if network == "unix" {
+		// remove Unix socket before use.
+		if err = p.remove(address); err != nil && !os.IsNotExist(err) {
+			// Anything other than "file not found" is an error.
+			return nil, fmt.Errorf("unable to remove unix://%s: %v", address, err)
 		}
-		configStore2URL = "fs://" + s.configDir
 	}
 
-	reg2 := store.NewRegistry2(config.Store2Inventory()...)
-	store2, err := p.newStore2(reg2, configStore2URL)
-	if err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("unable to connect to the configuration server: %v", err)
+	if s.listener, err = p.listen(network, address); err != nil {
+		return nil, fmt.Errorf("unable to listen: %v", err)
 	}
 
-	var dispatcher mixerRuntime.Dispatcher
-	if dispatcher, err = p.newRuntime(eval, evaluator.NewTypeChecker(), eval, s.gp, s.adapterGP,
-		a.ConfigIdentityAttribute, a.ConfigDefaultNamespace, store2, adapterMap, a.Templates); err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("unable to create runtime dispatcher: %v", err)
+	st := a.ConfigStore
+	if st == nil {
+		configStoreURL := a.ConfigStoreURL
+		if configStoreURL == "" {
+			configStoreURL = "k8s://"
+		}
+
+		reg := store.NewRegistry(config.StoreInventory()...)
+		groupVersion := &schema.GroupVersion{Group: crd.ConfigAPIGroup, Version: crd.ConfigAPIVersion}
+		if st, err = reg.NewStore(configStoreURL, groupVersion, a.CredentialOptions, runtimeconfig.CriticalKinds()); err != nil {
+			return nil, fmt.Errorf("unable to connect to the configuration server: %v", err)
+		}
+	}
+
+	var rt *runtime.Runtime
+	templateMap := make(map[string]*template.Info, len(a.Templates))
+	for k, v := range a.Templates {
+		t := v // Make a local copy, otherwise we end up capturing the location of the last entry
+		templateMap[k] = &t
+	}
+
+	var kinds map[string]proto.Message
+	if a.UseAdapterCRDs {
+		kinds = runtimeconfig.KindMap(adapterMap, templateMap)
+	} else {
+		kinds = runtimeconfig.KindMap(map[string]*adapter.Info{}, templateMap)
+	}
+
+	if err := st.Init(kinds); err != nil {
+		return nil, fmt.Errorf("unable to initialize config store: %v", err)
+	}
+
+	// block wait for the config store to sync
+	log.Info("Awaiting for config store sync...")
+	if err := st.WaitForSynced(30 * time.Second); err != nil {
+		return nil, err
+	}
+
+	log.Info("Starting runtime config watch...")
+	rt = p.newRuntime(st, templateMap, adapterMap, a.ConfigDefaultNamespace,
+		s.gp, s.adapterGP, a.TracingOptions.TracingEnabled())
+
+	if err = p.runtimeListen(rt); err != nil {
+		return nil, fmt.Errorf("unable to listen: %v", err)
+	}
+
+	s.dispatcher = rt.Dispatcher()
+
+	// see issue https://github.com/istio/istio/issues/9596
+	a.NumCheckCacheEntries = 0
+
+	if a.NumCheckCacheEntries > 0 {
+		s.checkCache = checkcache.New(a.NumCheckCacheEntries)
 	}
 
 	// get the grpc server wired up
 	grpc.EnableTracing = a.EnableGRPCTracing
+
+	exporter, err := p.newOpenCensusExporter()
+	if err != nil {
+		return nil, fmt.Errorf("could not build opencensus exporter: %v", err)
+	}
+	view.RegisterExporter(exporter)
+
+	// Register the views to collect server request count.
+	if err := p.registerOpenCensusViews(ocgrpc.DefaultServerViews...); err != nil {
+		return nil, fmt.Errorf("could not register default server views: %v", err)
+	}
+
+	throttler := loadshedding.NewThrottler(a.LoadSheddingOptions)
+	if eval := throttler.Evaluator(loadshedding.GRPCLatencyEvaluatorName); eval != nil {
+		grpcOptions = append(grpcOptions, grpc.StatsHandler(newMultiStatsHandler(&ocgrpc.ServerHandler{}, eval.(*loadshedding.GRPCLatencyEvaluator))))
+	} else {
+		grpcOptions = append(grpcOptions, grpc.StatsHandler(&ocgrpc.ServerHandler{}))
+	}
+
 	s.server = grpc.NewServer(grpcOptions...)
-	mixerpb.RegisterMixerServer(s.server, api.NewGRPCServer(dispatcher, s.gp))
+	mixerpb.RegisterMixerServer(s.server, api.NewGRPCServer(s.dispatcher, s.gp, s.checkCache, throttler))
+
+	if a.LivenessProbeOptions.IsValid() {
+		s.livenessProbe = probe.NewFileController(a.LivenessProbeOptions)
+		s.RegisterProbe(s.livenessProbe, "server")
+		s.livenessProbe.Start()
+	}
+
+	if a.ReadinessProbeOptions.IsValid() {
+		s.readinessProbe = probe.NewFileController(a.ReadinessProbeOptions)
+		rt.RegisterProbe(s.readinessProbe, "dispatcher")
+		st.RegisterProbe(s.readinessProbe, "store")
+		s.readinessProbe.Start()
+	}
+
+	log.Info("Starting monitor server...")
+	if s.monitor, err = p.startMonitor(a.MonitoringPort, a.EnableProfiling, p.listen); err != nil {
+		return nil, fmt.Errorf("unable to setup monitoring: %v", err)
+	}
+
+	s.controlZ, _ = ctrlz.Run(a.IntrospectionOptions, nil)
 
 	return s, nil
 }
 
-// Takes the string-based configs and creates a directory with config files from it.
-func serializeConfigs(globalConfig string, serviceConfig string) (string, error) {
-	configDir, err := ioutil.TempDir("", "mixer")
-	if err == nil {
-		s := path.Join(configDir, "service.yaml")
-		if err = ioutil.WriteFile(s, []byte(serviceConfig), 0666); err == nil {
-			g := path.Join(configDir, "global.yaml")
-			if err = ioutil.WriteFile(g, []byte(globalConfig), 0666); err == nil {
-				return configDir, nil
-			}
+func extractNetAddress(apiPort uint16, apiAddress string) (string, string) {
+	if apiAddress != "" {
+		idx := strings.Index(apiAddress, "://")
+		if idx < 0 {
+			return "tcp", apiAddress
 		}
 
-		_ = os.RemoveAll(configDir)
+		return apiAddress[:idx], apiAddress[idx+3:]
 	}
 
-	return "", err
+	return "tcp", fmt.Sprintf(":%d", apiPort)
 }
 
 // Run enables Mixer to start receiving gRPC requests on its main API port.
 func (s *Server) Run() {
 	s.shutdown = make(chan error, 1)
+	s.SetAvailable(nil)
 	go func() {
 		// go to work...
 		err := s.server.Serve(s.listener)
@@ -218,9 +310,19 @@ func (s *Server) Wait() error {
 
 // Close cleans up resources used by the server.
 func (s *Server) Close() error {
+	log.Info("Close server")
+
 	if s.shutdown != nil {
 		s.server.GracefulStop()
-		s.Wait()
+		_ = s.Wait()
+	}
+
+	if s.controlZ != nil {
+		s.controlZ.Close()
+	}
+
+	if s.checkCache != nil {
+		_ = s.checkCache.Close()
 	}
 
 	if s.listener != nil {
@@ -243,9 +345,16 @@ func (s *Server) Close() error {
 		_ = s.adapterGP.Close()
 	}
 
-	if s.configDir != "" {
-		_ = os.RemoveAll(s.configDir)
+	if s.livenessProbe != nil {
+		_ = s.livenessProbe.Close()
 	}
+
+	if s.readinessProbe != nil {
+		_ = s.readinessProbe.Close()
+	}
+
+	// final attempt to purge buffered logs
+	_ = log.Sync()
 
 	return nil
 }
@@ -253,4 +362,10 @@ func (s *Server) Close() error {
 // Addr returns the address of the server's API port, where gRPC requests can be sent.
 func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
+}
+
+// Dispatcher returns the dispatcher that was created during server creation. This should only
+// be used for testing purposes only.
+func (s *Server) Dispatcher() dispatcher.Dispatcher {
+	return s.dispatcher
 }

@@ -19,7 +19,7 @@ import (
 	"strconv"
 	"time"
 
-	rpc "github.com/googleapis/googleapis/google/rpc"
+	rpc "github.com/gogo/googleapis/google/rpc"
 	sc "google.golang.org/api/servicecontrol/v1"
 
 	"istio.io/istio/mixer/adapter/servicecontrol/template/servicecontrolreport"

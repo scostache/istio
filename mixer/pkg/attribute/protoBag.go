@@ -21,14 +21,19 @@ import (
 	"sync"
 
 	mixerpb "istio.io/api/mixer/v1"
-	"istio.io/istio/pkg/log"
 )
-
-// TODO: consider implementing a pool of proto bags
 
 type attributeRef struct {
 	Name   string
 	MapKey string
+}
+
+// ReferencedAttributeSnapshot keeps track of the attribute reference state for a mutable bag.
+// You can snapshot the referenced attributes with SnapshotReferencedAttributes and later
+// reinstall them with RestoreReferencedAttributes. Note that a snapshot can only be used
+// once, the RestoreReferencedAttributes call is destructive.
+type ReferencedAttributeSnapshot struct {
+	referencedAttrs map[attributeRef]mixerpb.ReferencedAttributes_Condition
 }
 
 // ProtoBag implements the Bag interface on top of an Attributes proto.
@@ -45,9 +50,21 @@ type ProtoBag struct {
 	referencedAttrsMutex sync.Mutex
 }
 
-// NewProtoBag creates a new proto-based attribute bag.
-func NewProtoBag(proto *mixerpb.CompressedAttributes, globalDict map[string]int32, globalWordList []string) *ProtoBag {
-	log.Debugf("Creating bag with attributes: %v", proto)
+// referencedAttrsSize is the size of referenced attributes.
+const referencedAttrsSize = 16
+
+var protoBags = sync.Pool{
+	New: func() interface{} {
+		return &ProtoBag{
+			referencedAttrs: make(map[attributeRef]mixerpb.ReferencedAttributes_Condition, referencedAttrsSize),
+		}
+	},
+}
+
+// GetProtoBag returns a proto-based attribute bag.
+// When you are done using the proto bag, call the Done method to recycle it.
+func GetProtoBag(proto *mixerpb.CompressedAttributes, globalDict map[string]int32, globalWordList []string) *ProtoBag {
+	pb := protoBags.Get().(*ProtoBag)
 
 	// build the message-level dictionary
 	d := make(map[string]int32, len(proto.Words))
@@ -55,36 +72,14 @@ func NewProtoBag(proto *mixerpb.CompressedAttributes, globalDict map[string]int3
 		d[name] = slotToIndex(i)
 	}
 
-	return &ProtoBag{
-		proto:           proto,
-		globalDict:      globalDict,
-		globalWordList:  globalWordList,
-		messageDict:     d,
-		referencedAttrs: make(map[attributeRef]mixerpb.ReferencedAttributes_Condition, 16),
-	}
-}
+	pb.proto = proto
+	pb.globalDict = globalDict
+	pb.globalWordList = globalWordList
+	pb.messageDict = d
 
-// StringMap wraps a map[string]string and reference counts it
-type StringMap struct {
-	// name of the stringmap  -- request.headers
-	name string
-	// entries in the stringmap
-	entries map[string]string
-	// protoBag that owns this stringmap
-	pb *ProtoBag
-}
+	scope.Debugf("Returning bag with attributes:\n%v", pb)
 
-// Get returns a stringmap value and records access
-func (s StringMap) Get(key string) (string, bool) {
-	cond := mixerpb.ABSENCE
-	str, found := s.entries[key]
-
-	if found {
-		cond = mixerpb.EXACT
-	}
-	// TODO add REGEX condition
-	s.pb.trackMapReference(s.name, key, cond)
-	return str, found
+	return pb
 }
 
 // Get returns an attribute value.
@@ -92,7 +87,7 @@ func (pb *ProtoBag) Get(name string) (interface{}, bool) {
 	// find the dictionary index for the given string
 	index, ok := pb.getIndex(name)
 	if !ok {
-		log.Debugf("Attribute '%s' not in either global or message dictionaries", name)
+		scope.Debugf("Attribute '%s' not in either global or message dictionaries", name)
 		// the string is not in the dictionary, and hence the attribute is not in the proto either
 		pb.trackReference(name, mixerpb.ABSENCE)
 		return nil, false
@@ -114,8 +109,8 @@ func (pb *ProtoBag) Get(name string) (interface{}, bool) {
 }
 
 // GetReferencedAttributes returns the set of attributes that have been referenced through this bag.
-func (pb *ProtoBag) GetReferencedAttributes(globalDict map[string]int32, globalWordCount int) mixerpb.ReferencedAttributes {
-	output := mixerpb.ReferencedAttributes{}
+func (pb *ProtoBag) GetReferencedAttributes(globalDict map[string]int32, globalWordCount int) *mixerpb.ReferencedAttributes {
+	output := &mixerpb.ReferencedAttributes{}
 
 	ds := newDictState(globalDict, globalWordCount)
 
@@ -146,6 +141,28 @@ func (pb *ProtoBag) ClearReferencedAttributes() {
 	}
 }
 
+// RestoreReferencedAttributes sets the list of referenced attributes being tracked by this bag
+func (pb *ProtoBag) RestoreReferencedAttributes(snap ReferencedAttributeSnapshot) {
+	ra := make(map[attributeRef]mixerpb.ReferencedAttributes_Condition, len(snap.referencedAttrs))
+	for k, v := range snap.referencedAttrs {
+		ra[k] = v
+	}
+	pb.referencedAttrs = ra
+}
+
+// SnapshotReferencedAttributes grabs a snapshot of the currently referenced attributes
+func (pb *ProtoBag) SnapshotReferencedAttributes() ReferencedAttributeSnapshot {
+	var snap ReferencedAttributeSnapshot
+
+	pb.referencedAttrsMutex.Lock()
+	snap.referencedAttrs = make(map[attributeRef]mixerpb.ReferencedAttributes_Condition, len(pb.referencedAttrs))
+	for k, v := range pb.referencedAttrs {
+		snap.referencedAttrs[k] = v
+	}
+	pb.referencedAttrsMutex.Unlock()
+	return snap
+}
+
 func (pb *ProtoBag) trackMapReference(name string, key string, condition mixerpb.ReferencedAttributes_Condition) {
 	pb.referencedAttrsMutex.Lock()
 	pb.referencedAttrs[attributeRef{Name: name, MapKey: key}] = condition
@@ -164,7 +181,7 @@ func (pb *ProtoBag) internalGet(name string, index int32) (interface{}, bool) {
 		// found the attribute, now convert its value from a dictionary index to a string
 		str, err := pb.lookup(strIndex)
 		if err != nil {
-			log.Errorf("string attribute %s: %v", name, err)
+			scope.Errorf("string attribute %s: %v", name, err)
 			return nil, false
 		}
 
@@ -188,7 +205,7 @@ func (pb *ProtoBag) internalGet(name string, index int32) (interface{}, bool) {
 		// convert from map[int32]int32 to map[string]string
 		m, err := pb.convertStringMap(sm.Entries)
 		if err != nil {
-			log.Errorf("string map %s: %v", name, err)
+			scope.Errorf("string map %s: %v", name, err)
 			return nil, false
 		}
 
@@ -285,6 +302,48 @@ func (pb *ProtoBag) convertStringMap(s map[int32]int32) (map[string]string, erro
 	return d, nil
 }
 
+// Contains returns true if protobag contains this key.
+func (pb *ProtoBag) Contains(key string) bool {
+	idx, found := pb.getIndex(key)
+	if !found {
+		return false
+	}
+
+	if _, ok := pb.proto.Strings[idx]; ok {
+		return true
+	}
+
+	if _, ok := pb.proto.StringMaps[idx]; ok {
+		return true
+	}
+
+	if _, ok := pb.proto.Int64S[idx]; ok {
+		return true
+	}
+
+	if _, ok := pb.proto.Doubles[idx]; ok {
+		return true
+	}
+
+	if _, ok := pb.proto.Bools[idx]; ok {
+		return true
+	}
+
+	if _, ok := pb.proto.Timestamps[idx]; ok {
+		return true
+	}
+
+	if _, ok := pb.proto.Durations[idx]; ok {
+		return true
+	}
+
+	if _, ok := pb.proto.Bytes[idx]; ok {
+		return true
+	}
+
+	return false
+}
+
 // Names returns the names of all the attributes known to this bag.
 func (pb *ProtoBag) Names() []string {
 	names := make(map[string]bool)
@@ -348,27 +407,35 @@ func (pb *ProtoBag) Names() []string {
 
 // Done indicates the bag can be reclaimed.
 func (pb *ProtoBag) Done() {
-	// NOP
+	pb.Reset()
+	protoBags.Put(pb)
 }
 
-// DebugString runs through the named attributes, looks up their values,
+// Reset removes all local state.
+func (pb *ProtoBag) Reset() {
+	pb.proto = nil
+	pb.globalDict = make(map[string]int32)
+	pb.globalWordList = nil
+	pb.messageDict = make(map[string]int32)
+	pb.convertedStringMaps = make(map[int32]StringMap)
+	pb.referencedAttrs = make(map[attributeRef]mixerpb.ReferencedAttributes_Condition, referencedAttrsSize)
+	pb.stringMapMutex = sync.RWMutex{}
+	pb.referencedAttrsMutex = sync.Mutex{}
+}
+
+// String runs through the named attributes, looks up their values,
 // and prints them to a string.
-func (pb *ProtoBag) DebugString() string {
-	var buf bytes.Buffer
+func (pb *ProtoBag) String() string {
+	buf := &bytes.Buffer{}
 
 	names := pb.Names()
 	sort.Strings(names)
 
 	for _, name := range names {
 		// find the dictionary index for the given string
-		index, ok := pb.getIndex(name)
-		if !ok {
-			log.Debugf("Attribute '%s' not in either global or message dictionaries", name)
-			continue
-		}
-
+		index, _ := pb.getIndex(name)
 		if result, ok := pb.internalGet(name, index); ok {
-			buf.WriteString(fmt.Sprintf("%-30s: %v\n", name, result))
+			fmt.Fprintf(buf, "%-30s: %v\n", name, result)
 		}
 	}
 	return buf.String()

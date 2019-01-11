@@ -16,6 +16,7 @@ package perf
 
 import (
 	"testing"
+	"time"
 )
 
 func TestControllerBasic(t *testing.T) {
@@ -31,16 +32,16 @@ func TestControllerBasic(t *testing.T) {
 
 	c.waitForClient()
 
-	if err = c.initializeClients("10.10.10.10", &Setup{}); err != nil {
+	if err = c.initializeClients("10.10.10.10", &Setup{Loads: []Load{{}}}); err != nil {
 		t.Fatalf("Initialization failed: %v", err)
 	}
 
-	if err = c.runClients(10); err != nil {
-		t.Fatalf("run failed.")
+	if err = c.runClients(10, time.Duration(0)); err != nil {
+		t.Fatalf("run failed: %v", err)
 	}
 
-	if err = c.runClients(50); err != nil {
-		t.Fatalf("run failed")
+	if err = c.runClients(50, time.Duration(0)); err != nil {
+		t.Fatalf("run failed: %v", err)
 	}
 
 	if err = c.close(); err != nil {

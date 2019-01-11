@@ -21,7 +21,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 
-	cfg "istio.io/istio/mixer/pkg/config/proto"
+	cfg "istio.io/api/policy/v1beta1"
 )
 
 type fakeValidator struct {
@@ -77,7 +77,7 @@ func TestValidate(t *testing.T) {
 			"unknown kinds",
 			map[string]proto.Message{},
 			errors.New("fail"),
-			backendEvent(Update, "Unknown", "foo", map[string]interface{}{"foo": "bar"}),
+			backendEvent(Update, "Unknown", "bar", map[string]interface{}{"foo": "bar"}),
 			nil,
 		},
 		{

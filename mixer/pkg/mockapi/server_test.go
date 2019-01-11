@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	rpc "github.com/gogo/googleapis/google/rpc"
 	"github.com/gogo/protobuf/proto"
-	rpc "github.com/googleapis/googleapis/google/rpc"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
@@ -73,7 +73,7 @@ func clearQuotaResponse(s *AttributesServer, h *ChannelsHandler) {
 
 func TestCheck(t *testing.T) {
 	handler := NewChannelsHandler()
-	attrSrv := NewAttributesServer(handler)
+	attrSrv := NewAttributesServer(handler, true)
 	grpcSrv, addr, err := startGRPCService(attrSrv)
 	if err != nil {
 		t.Fatalf("Could not start local grpc server: %v", err)
@@ -89,7 +89,7 @@ func TestCheck(t *testing.T) {
 
 	client := mixerpb.NewMixerClient(conn)
 
-	srcBag := attribute.NewProtoBag(&attrs, attrSrv.GlobalDict, attribute.GlobalList())
+	srcBag := attribute.GetProtoBag(&attrs, attrSrv.GlobalDict, attribute.GlobalList())
 	wantBag := attribute.CopyBag(srcBag)
 
 	noQuotaReq := &mixerpb.CheckRequest{Attributes: attrs}
@@ -97,12 +97,16 @@ func TestCheck(t *testing.T) {
 
 	refAttrs := srcBag.GetReferencedAttributes(attrSrv.GlobalDict, len(attribute.GlobalList()))
 
-	okCheckResp := &mixerpb.CheckResponse{Precondition: precondition(status.OK, mixerpb.CompressedAttributes{}, refAttrs)}
+	okCheckResp := &mixerpb.CheckResponse{Precondition: precondition(status.OK, refAttrs)}
+
+	okDictReq := &mixerpb.CheckRequest{Attributes: attrs, GlobalWordCount: 20}
+	badDictReq := &mixerpb.CheckRequest{Attributes: attrs, GlobalWordCount: 1000}
+
 	quotaResp := &mixerpb.CheckResponse{
-		Precondition: precondition(status.OK, mixerpb.CompressedAttributes{}, refAttrs),
+		Precondition: precondition(status.OK, refAttrs),
 		Quotas: map[string]mixerpb.CheckResponse_QuotaResult{
-			"foo": {ValidDuration: 55 * time.Second, GrantedAmount: 999, ReferencedAttributes: refAttrs},
-			"bar": {ValidDuration: 55 * time.Second, GrantedAmount: 999, ReferencedAttributes: refAttrs},
+			"foo": {ValidDuration: 55 * time.Second, GrantedAmount: 999, ReferencedAttributes: *refAttrs},
+			"bar": {ValidDuration: 55 * time.Second, GrantedAmount: 999, ReferencedAttributes: *refAttrs},
 		},
 	}
 	quotaDispatches := []QuotaDispatchInfo{
@@ -122,6 +126,8 @@ func TestCheck(t *testing.T) {
 	}{
 		{"basic", noQuotaReq, noop, noop, false, okCheckResp, wantBag, nil},
 		{"grpc err", noQuotaReq, setGRPCErr, clearGRPCErr, true, okCheckResp, nil, nil},
+		{"ok dictionary", okDictReq, noop, noop, false, okCheckResp, wantBag, nil},
+		{"bad dictionary", badDictReq, noop, noop, true, nil, nil, nil},
 		{"check response", quotaReq, setQuotaResponse, clearQuotaResponse, false, quotaResp, wantBag, quotaDispatches},
 	}
 
@@ -191,7 +197,7 @@ func TestCheck(t *testing.T) {
 
 func TestReport(t *testing.T) {
 	handler := NewChannelsHandler()
-	attrSrv := NewAttributesServer(handler)
+	attrSrv := NewAttributesServer(handler, false)
 	grpcSrv, addr, err := startGRPCService(attrSrv)
 	if err != nil {
 		t.Fatalf("Could not start local grpc server: %v", err)
@@ -223,7 +229,7 @@ func TestReport(t *testing.T) {
 
 	words := []string{"foo", "bar", "baz"}
 
-	baseBag := attribute.CopyBag(attribute.NewProtoBag(&attrs[0], attrSrv.GlobalDict, attribute.GlobalList()))
+	baseBag := attribute.CopyBag(attribute.GetProtoBag(&attrs[0], attrSrv.GlobalDict, attribute.GlobalList()))
 	middleBag := attribute.CopyBag(baseBag)
 	if err = middleBag.UpdateBagFromProto(&attrs[1], attribute.GlobalList()); err != nil {
 		t.Fatalf("Could not set up attribute bags for testing: %v", err)
@@ -289,7 +295,7 @@ func TestReport(t *testing.T) {
 	}
 }
 
-func startGRPCService(attrSrv *AttributesServer) (*grpc.Server, string, error) {
+func startGRPCService(attrSrv mixerpb.MixerServer) (*grpc.Server, string, error) {
 	lis, port, err := ListenerAndPort()
 	if err != nil {
 		return nil, "", fmt.Errorf("could not find suitable listener: %v", err)
@@ -304,12 +310,11 @@ func startGRPCService(attrSrv *AttributesServer) (*grpc.Server, string, error) {
 	return grpcSrv, fmt.Sprintf("localhost:%d", port), nil
 }
 
-func precondition(status rpc.Status, attrs mixerpb.CompressedAttributes, refAttrs mixerpb.ReferencedAttributes) mixerpb.CheckResponse_PreconditionResult {
+func precondition(status rpc.Status, refAttrs *mixerpb.ReferencedAttributes) mixerpb.CheckResponse_PreconditionResult {
 	return mixerpb.CheckResponse_PreconditionResult{
 		Status:               status,
 		ValidUseCount:        DefaultValidUseCount,
 		ValidDuration:        DefaultValidDuration,
-		Attributes:           attrs,
 		ReferencedAttributes: refAttrs,
 	}
 }

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// nolint: lll
+//go:generate $GOPATH/src/istio.io/istio/bin/mixer_codegen.sh -a mixer/adapter/servicecontrol/config/config.proto -x "-n servicecontrol -t apikey -t servicecontrolreport -t quota"
+//go:generate $GOPATH/src/istio.io/istio/bin/mixer_codegen.sh -t mixer/adapter/servicecontrol/template/servicecontrolreport/template.proto
+
 package servicecontrol
 
 import (
@@ -25,9 +29,9 @@ import (
 	"istio.io/istio/mixer/adapter/servicecontrol/config"
 	"istio.io/istio/mixer/adapter/servicecontrol/template/servicecontrolreport"
 	"istio.io/istio/mixer/pkg/adapter"
-	"istio.io/istio/mixer/pkg/cache"
 	"istio.io/istio/mixer/template/apikey"
 	"istio.io/istio/mixer/template/quota"
+	"istio.io/istio/pkg/cache"
 )
 
 // servicecontrol adapter builder
@@ -100,7 +104,7 @@ func validateRuntimeConfig(config *config.RuntimeConfig) *multierror.Error {
 
 func validateGcpServiceSetting(settings []*config.GcpServiceSetting) *multierror.Error {
 	var result *multierror.Error
-	if settings == nil || len(settings) == 0 {
+	if len(settings) == 0 {
 		result = multierror.Append(result, errors.New("settings is nil or empty"))
 		return result
 	}
@@ -144,17 +148,14 @@ func (b *builder) Build(context context.Context, env adapter.Env) (adapter.Handl
 		return nil, err
 	}
 
-	ctx, err := initializeHandlerContext(env, b.config, client)
-	if err != nil {
-		return nil, err
-	}
+	ctx := initializeHandlerContext(env, b.config, client)
 	ctx.checkDataShape = b.checkDataShape
 	ctx.reportDataShape = b.reportDataShape
-	return newHandler(ctx)
+	return newHandler(ctx), nil
 }
 
 func initializeHandlerContext(env adapter.Env, adapterCfg *config.Params,
-	client serviceControlClient) (*handlerContext, error) {
+	client serviceControlClient) *handlerContext {
 
 	configIndex := make(map[string]*config.GcpServiceSetting, len(adapterCfg.ServiceConfigs))
 	for _, cfg := range adapterCfg.ServiceConfigs {
@@ -172,7 +173,7 @@ func initializeHandlerContext(env adapter.Env, adapterCfg *config.Params,
 		serviceConfigIndex: configIndex,
 		checkResponseCache: checkCache,
 		client:             client,
-	}, nil
+	}
 }
 
 // GetInfo registers Adapter with Mixer.

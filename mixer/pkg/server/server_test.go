@@ -17,20 +17,23 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"strconv"
 	"testing"
 
+	"go.opencensus.io/stats/view"
 	"google.golang.org/grpc"
 
 	mixerpb "istio.io/api/mixer/v1"
-	"istio.io/istio/mixer/pkg/adapter"
-	"istio.io/istio/mixer/pkg/config/store"
-	"istio.io/istio/mixer/pkg/expr"
-	"istio.io/istio/mixer/pkg/il/evaluator"
-	"istio.io/istio/mixer/pkg/pool"
-	mixerRuntime "istio.io/istio/mixer/pkg/runtime"
-	"istio.io/istio/mixer/pkg/template"
+	"istio.io/istio/mixer/pkg/config/storetest"
+	"istio.io/istio/mixer/pkg/runtime"
+	generatedTmplRepo "istio.io/istio/mixer/template"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/tracing"
+	"istio.io/istio/pkg/version"
 )
 
 const (
@@ -44,7 +47,7 @@ spec:
     attributes:
       source.name:
         value_type: STRING
-      target.name:
+      destination.name:
         value_type: STRING
       response.count:
         value_type: INT64
@@ -76,7 +79,7 @@ spec:
   value: "2"
   dimensions:
     source: source.name | "mysrc"
-    target_ip: target.name | "mytarget"
+    target_ip: destination.name | "mytarget"
 
 ---
 
@@ -86,7 +89,7 @@ metadata:
   name: rule1
   namespace: istio-system
 spec:
-  selector: match(target.name, "*")
+  selector: match(destination.name, "*")
   actions:
   - handler: fakeHandlerConfig.fakeHandler
     instances:
@@ -96,7 +99,16 @@ spec:
 `
 )
 
+// defaultTestArgs returns result of DefaultArgs(), except with a modification to the LoggingOptions
+// to avoid a data race between gRpc and the logging code.
+func defaultTestArgs() *Args {
+	a := DefaultArgs()
+	a.LoggingOptions.LogGrpc = false // Avoid introducing a race to the server tests.
+	return a
+}
+
 // createClient returns a Mixer gRPC client, useful for tests
+// nolint: interfacer
 func createClient(addr net.Addr) (mixerpb.MixerClient, error) {
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	if err != nil {
@@ -106,16 +118,34 @@ func createClient(addr net.Addr) (mixerpb.MixerClient, error) {
 	return mixerpb.NewMixerClient(conn), nil
 }
 
-func TestBasic(t *testing.T) {
-	a := NewArgs()
+func newTestServer(globalCfg, serviceCfg string) (*Server, error) {
+	a := defaultTestArgs()
 	a.APIPort = 0
 	a.MonitoringPort = 0
-	a.GlobalConfig = globalCfg
-	a.ServiceConfig = serviceCfg
+	a.EnableProfiling = true
+	a.Templates = generatedTmplRepo.SupportedTmplInfo
+	a.LivenessProbeOptions.Path = "abc"
+	a.LivenessProbeOptions.UpdateInterval = 2
+	a.ReadinessProbeOptions.Path = "def"
+	a.ReadinessProbeOptions.UpdateInterval = 3
 
-	s, err := New(a)
+	var err error
+	if a.ConfigStore, err = storetest.SetupStoreForTest(globalCfg, serviceCfg); err != nil {
+		return nil, err
+	}
+
+	return New(a)
+}
+
+func TestBasic(t *testing.T) {
+	s, err := newTestServer(globalCfg, serviceCfg)
 	if err != nil {
 		t.Fatalf("Unable to create server: %v", err)
+	}
+
+	d := s.Dispatcher()
+	if d != s.dispatcher {
+		t.Fatalf("returned dispatcher is incorrect")
 	}
 
 	err = s.Close()
@@ -125,13 +155,7 @@ func TestBasic(t *testing.T) {
 }
 
 func TestClient(t *testing.T) {
-	a := NewArgs()
-	a.APIPort = 0
-	a.MonitoringPort = 0
-	a.GlobalConfig = globalCfg
-	a.ServiceConfig = serviceCfg
-
-	s, err := New(a)
+	s, err := newTestServer(globalCfg, serviceCfg)
 	if err != nil {
 		t.Fatalf("Unable to create server: %v", err)
 	}
@@ -154,64 +178,210 @@ func TestClient(t *testing.T) {
 	if err != nil {
 		t.Errorf("Got error during Close: %v", err)
 	}
+
+	err = s.Wait()
+	if err == nil {
+		t.Errorf("Got success, expecting failure")
+	}
 }
 
 func TestErrors(t *testing.T) {
-	a := NewArgs()
+	a := defaultTestArgs()
 	a.APIWorkerPoolSize = -1
-	a.GlobalConfig = globalCfg
-	a.ServiceConfig = serviceCfg
-
 	s, err := New(a)
 	if s != nil || err == nil {
 		t.Errorf("Got success, expecting error")
 	}
 
-	a = NewArgs()
-	a.APIPort = 0
-	a.MonitoringPort = 0
-	a.GlobalConfig = globalCfg
-	a.ServiceConfig = serviceCfg
-
-	for i := 0; i < 20; i++ {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			pt := newPatchTable()
-			switch i {
-			case 0:
-				pt.newILEvaluator = func(cacheSize int) (*evaluator.IL, error) {
+	testcases := []struct {
+		name    string
+		setupFn func(a *Args, pt *patchTable)
+	}{
+		{"empty config store URL",
+			func(a *Args, pt *patchTable) { a.ConfigStore = nil; a.ConfigStoreURL = "" }},
+		{"bad config store URL",
+			func(a *Args, pt *patchTable) { a.ConfigStore = nil; a.ConfigStoreURL = "DEADBEEF" }},
+		{"non-existent store URL",
+			func(a *Args, pt *patchTable) { a.ConfigStoreURL = "http://abogusurl.com" }},
+		{"failed tracing setup",
+			func(a *Args, pt *patchTable) {
+				pt.configTracing = func(_ string, _ *tracing.Options) (io.Closer, error) { return nil, errors.New("BAD") }
+			},
+		},
+		{"failed monitoring setup",
+			func(a *Args, pt *patchTable) {
+				pt.startMonitor = func(port uint16, enableProfiling bool, lf listenFunc) (*monitor, error) {
 					return nil, errors.New("BAD")
 				}
-			case 1:
-				pt.newRuntime = func(eval expr.Evaluator, typeChecker expr.TypeChecker, vocab mixerRuntime.VocabularyChangeListener, gp *pool.GoroutinePool,
-					handlerPool *pool.GoroutinePool,
-					identityAttribute string, defaultConfigNamespace string, s store.Store2, adapterInfo map[string]*adapter.Info,
-					templateInfo map[string]template.Info) (mixerRuntime.Dispatcher, error) {
-					return nil, errors.New("BAD")
-				}
-			case 2:
-				pt.newStore2 = func(r2 *store.Registry2, configURL string) (store.Store2, error) {
-					return nil, errors.New("BAD")
-				}
-			case 3:
-				pt.startTracer = func(zipkinURL string, jaegerURL string, logTraceSpans bool) (*mixerTracer, grpc.UnaryServerInterceptor, error) {
-					return nil, nil, errors.New("BAD")
-				}
-			case 4:
-				pt.startMonitor = func(port uint16) (*monitor, error) {
-					return nil, errors.New("BAD")
-				}
-			case 5:
+			},
+		},
+		{"duplicate port registration",
+			func(a *Args, pt *patchTable) {
+				a.MonitoringPort = 1234
 				pt.listen = func(network string, address string) (net.Listener, error) {
+					// fail any net.Listen call that's not for the monitoring port.
+					if address != ":1234" {
+						return nil, errors.New("BAD")
+					}
+					return net.Listen(network, address)
+				}
+			},
+		},
+		{"listener failure",
+			func(a *Args, pt *patchTable) {
+				a.MonitoringPort = 1234
+				pt.listen = func(network string, address string) (net.Listener, error) {
+					// fail any net.Listen call that's not for the monitoring port.
+					if address == ":1234" {
+						return nil, errors.New("BAD")
+					}
+					return net.Listen(network, address)
+				}
+			},
+		},
+		{"failed logging setup",
+			func(a *Args, pt *patchTable) {
+				pt.configLog = func(options *log.Options) error {
+					return errors.New("BAD")
+				}
+			},
+		},
+		{"failed runtime setup",
+			func(a *Args, pt *patchTable) {
+				pt.runtimeListen = func(rt *runtime.Runtime) error {
+					return errors.New("BAD")
+				}
+			},
+		},
+		{"failed OpenCensus Exporter setup",
+			func(a *Args, pt *patchTable) {
+				pt.newOpenCensusExporter = func() (view.Exporter, error) {
 					return nil, errors.New("BAD")
 				}
-			default:
-				return
+			},
+		},
+		{"failed OpenCensus view registration",
+			func(a *Args, pt *patchTable) {
+				pt.registerOpenCensusViews = func(...*view.View) error {
+					// panic(nil)
+					return errors.New("BAD")
+				}
+			},
+		},
+		{"unix socket removal",
+			func(a *Args, pt *patchTable) {
+				a.APIAddress = "unix:///dev"
+			},
+		},
+		{"Unix API address failed",
+			func(a *Args, pt *patchTable) {
+				a.APIAddress = "unix://a/b/c"
+				pt.remove = func(name string) error { return errors.New("BAD") }
+			},
+		},
+	}
+
+	// This test is designed to exercise the many failure paths in the server creation
+	// code. This is mostly about replacing methods in the patch table with methods that
+	// return failures in order to make sure the failure recovery code is working right.
+	// There are also some cases that tweak some parameters to tickle particular execution paths.
+	// So for all these cases, we expect to get a failure when trying to create the server instance.
+
+	for _, v := range testcases {
+		t.Run(v.name, func(t *testing.T) {
+
+			// setup
+			configStore, cerr := storetest.SetupStoreForTest(globalCfg, serviceCfg)
+			if cerr != nil {
+				t.Fatal(cerr)
+			}
+			a = defaultTestArgs()
+			a.APIPort = 0
+			a.MonitoringPort = 0
+			a.TracingOptions.LogTraceSpans = true
+			a.ConfigStore = configStore
+			a.ConfigStoreURL = ""
+			pt := newPatchTable()
+
+			// test
+			v.setupFn(a, pt)
+			s, err = newServer(a, pt)
+			if s != nil || err == nil {
+				s.Close()
+				t.Errorf("Got success, expecting error")
 			}
 
-			s, err := new(a, pt)
-			if s != nil || err == nil {
-				t.Errorf("Got success, expecting error")
+			// cleanup
+			configStore.Stop()
+		})
+	}
+}
+
+func TestExtractNetAddress(t *testing.T) {
+	cases := []struct {
+		apiPort       uint16
+		apiAddress    string
+		resultNetwork string
+		resultAddress string
+	}{
+		{0, "tcp://127.0.0.1:0", "tcp", "127.0.0.1:0"},
+		{0, ":0", "tcp", ":0"},
+		{0, "unix://a/b/c", "unix", "a/b/c"},
+		{132, "", "tcp", ":132"},
+	}
+
+	for i, c := range cases {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			n, a := extractNetAddress(c.apiPort, c.apiAddress)
+
+			if n != c.resultNetwork || a != c.resultAddress {
+				t.Errorf("Expecting %s:%s, got %s:%s", c.resultNetwork, c.resultAddress, n, a)
 			}
 		})
 	}
+}
+
+func TestMonitoringMux(t *testing.T) {
+	configStore, _ := storetest.SetupStoreForTest(globalCfg, serviceCfg)
+
+	a := defaultTestArgs()
+	a.ConfigStore = configStore
+	a.MonitoringPort = 0
+	a.APIPort = 0
+	s, err := New(a)
+	if err != nil {
+		t.Fatalf("Got %v, expecting success", err)
+	}
+
+	r := &http.Request{}
+	r.Method = "GET"
+	r.URL, _ = url.Parse("http://localhost/version")
+	rw := &responseWriter{}
+
+	// this is exercising the mux handler code in monitoring.go. The supplied rw is used to return
+	// an error which causes all code paths in the mux handler code to be visited.
+	s.monitor.monitoringServer.Handler.ServeHTTP(rw, r)
+
+	v := string(rw.payload)
+	if v != version.Info.String() {
+		t.Errorf("Got version %v, expecting %v", v, version.Info.String())
+	}
+
+	_ = s.Close()
+}
+
+type responseWriter struct {
+	payload []byte
+}
+
+func (rw *responseWriter) Header() http.Header {
+	return nil
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	rw.payload = b
+	return -1, errors.New("BAD")
+}
+
+func (rw *responseWriter) WriteHeader(int) {
 }

@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
+	rpc "github.com/gogo/googleapis/google/rpc"
 	pbtypes "github.com/gogo/protobuf/types"
-	rpc "github.com/googleapis/googleapis/google/rpc"
 	sc "google.golang.org/api/servicecontrol/v1"
 )
 

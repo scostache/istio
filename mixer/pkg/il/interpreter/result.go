@@ -19,6 +19,7 @@ import (
 	"math"
 	"time"
 
+	"istio.io/istio/mixer/pkg/attribute"
 	"istio.io/istio/mixer/pkg/il"
 	"istio.io/istio/pkg/log"
 )
@@ -108,7 +109,12 @@ func (r Result) AsInterface() interface{} {
 	case il.Void:
 		return nil
 	case il.Interface:
-		return r.vi
+		// TODO: currently byte[] can only be net.IP address type, so we can
+		// safely do this. Ideally we want to have a better fix.
+		if attribute.CheckType(r.vi) {
+			return r.vi
+		}
+		fallthrough
 	default:
 		log.Warnf("interpreter.Result: Unknown type encountered. Returning nil. type: '%v'", r.t)
 		return nil

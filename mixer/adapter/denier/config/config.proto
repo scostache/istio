@@ -14,6 +14,19 @@
 
 syntax = "proto3";
 
+// $title: Denier
+// $description: Adapter that always returns a precondition denial.
+// $location: https://istio.io/docs/reference/config/policy-and-telemetry/adapters/denier.html
+// $supported_templates: listentry,quota,checknothing
+// $aliases:
+// $  - /docs/reference/config/adapters/denier.html
+
+// The `denier` adapter is designed to always return a denial to precondition
+// checks. You can specify the exact error to return for these denials.
+//
+// This adapter supports the [checknothing template](https://istio.io/docs/reference/config/policy-and-telemetry/templates/checknothing/),
+// the [listentry template](https://istio.io/docs/reference/config/policy-and-telemetry/templates/listentry/),
+// and the [quota template](https://istio.io/docs/reference/config/policy-and-telemetry/templates/quota/).
 package adapter.denier.config;
 
 import "gogoproto/gogo.proto";
@@ -25,6 +38,7 @@ option (gogoproto.goproto_getters_all) = false;
 option (gogoproto.equal_all) = false;
 option (gogoproto.gostring_all) = false;
 
+// Configuration format for the Denier adapter.
 message Params {
 	// The error to return when denying a request.
 	google.rpc.Status status = 1 [(gogoproto.nullable) = false];

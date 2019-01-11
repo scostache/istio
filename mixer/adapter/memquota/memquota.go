@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// nolint: lll
+//go:generate $GOPATH/src/istio.io/istio/bin/mixer_codegen.sh -a mixer/adapter/memquota/config/config.proto -x "-n memquota -t quota"
+
 // Package memquota provides a simple in-memory quota implementation. It's
 // trivial to set up, but it has various limitations:
 //
@@ -64,17 +67,8 @@ type Limit interface {
 func matchDimensions(cfg map[string]string, inst map[string]interface{}) bool {
 	for k, val := range cfg {
 		rval := inst[k]
-		if rval == val { // this dimension matches, on to next comparison.
+		if adapter.StringEquals(rval, val) { // this dimension matches, on to next comparison.
 			continue
-		}
-
-		// if rval has a string representation then compare it with val
-		// For example net.ip has a useful string representation.
-		switch v := rval.(type) {
-		case fmt.Stringer:
-			if v.String() == val {
-				continue
-			}
 		}
 		// rval does not match val.
 		return false
@@ -88,16 +82,14 @@ func limit(cfg *config.Params_Quota, instance *quota.Instance, l adapter.Logger)
 	for idx := range cfg.Overrides {
 		o := cfg.Overrides[idx]
 		if matchDimensions(o.Dimensions, instance.Dimensions) {
-			if l.VerbosityLevel(4) {
-				l.Infof("quota override: %v selected for %v", o, *instance)
-			}
+			l.Debugf("quota override: %v selected for %v", o, *instance)
 			// all dimensions matched, we found the override.
 			return &o
 		}
 	}
-	if l.VerbosityLevel(4) {
-		l.Infof("quota default: %v selected for %v", cfg.MaxAmount, *instance)
-	}
+
+	l.Debugf("quota default: %v selected for %v", cfg.MaxAmount, *instance)
+
 	// no overrides, use default limit.
 	return cfg
 }
@@ -114,7 +106,7 @@ func (h *handler) HandleQuota(context context.Context, instance *quota.Instance,
 }
 
 func (h *handler) alloc(instance *quota.Instance, args adapter.QuotaArgs, q Limit) (adapter.QuotaResult, error) {
-	amount, exp, key, err := h.common.handleDedup(instance, args, func(key string, currentTime time.Time, currentTick int64) (int64, time.Time,
+	amount, exp, key := h.common.handleDedup(instance, args, func(key string, currentTime time.Time, currentTick int64) (int64, time.Time,
 		time.Duration) {
 		result := args.QuotaAmount
 
@@ -154,19 +146,17 @@ func (h *handler) alloc(instance *quota.Instance, args adapter.QuotaArgs, q Limi
 		return result, currentTime.Add(q.GetValidDuration()), q.GetValidDuration()
 	})
 
-	if h.logger.VerbosityLevel(2) {
-		h.logger.Infof(" AccessLog %d/%d %s", amount, args.QuotaAmount, key)
-	}
+	h.logger.Debugf(" AccessLog %d/%d %s", amount, args.QuotaAmount, key)
 
 	return adapter.QuotaResult{
 		Status:        status.OK,
 		Amount:        amount,
 		ValidDuration: exp,
-	}, err
+	}, nil
 }
 
 func (h *handler) free(instance *quota.Instance, args adapter.QuotaArgs, q Limit) (adapter.QuotaResult, error) {
-	amount, _, _, err := h.common.handleDedup(instance, args, func(key string, currentTime time.Time, currentTick int64) (int64, time.Time,
+	amount, _, _ := h.common.handleDedup(instance, args, func(key string, currentTime time.Time, currentTick int64) (int64, time.Time,
 		time.Duration) {
 		result := args.QuotaAmount
 
@@ -205,7 +195,7 @@ func (h *handler) free(instance *quota.Instance, args adapter.QuotaArgs, q Limit
 	return adapter.QuotaResult{
 		Status: status.OK,
 		Amount: amount,
-	}, err
+	}, nil
 }
 
 func (h *handler) Close() error {

@@ -21,7 +21,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -32,21 +31,41 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-func initTestServer(path string, resp []byte) *httptest.Server {
+const (
+	doc = `{
+  "devpayProductCodes" : null,
+  "privateIp" : "10.16.17.248",
+  "availabilityZone" : "us-west-2b",
+  "version" : "2010-08-31",
+  "instanceId" : "i-0646c9efe2e62dc63",
+  "billingProducts" : null,
+  "instanceType" : "c3.large",
+  "accountId" : "977777657611",
+  "architecture" : "x86_64",
+  "kernelId" : null,
+  "ramdiskId" : null,
+  "imageId" : "ami-fabf5c82",
+  "pendingTime" : "2017-08-27T17:18:20Z",
+  "region" : "us-west-2"
+}`
+)
+
+func initTestServer(resp map[string][]byte) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.RequestURI != path {
+		if _, ok := resp[r.RequestURI]; !ok {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 
-		_, _ = w.Write(resp)
+		_, _ = w.Write(resp[r.RequestURI])
 	}))
 }
 
 func TestIsProperPlatform(t *testing.T) {
 	server := initTestServer(
-		"/latest/meta-data/instance-id",
-		[]byte("instance-id"),
+		map[string][]byte{
+			"/latest/meta-data/instance-id": []byte("instance-id"),
+		},
 	)
 
 	c := ec2metadata.New(unit.Session, &aws.Config{Endpoint: aws.String(server.URL + "/latest")})
@@ -62,7 +81,7 @@ func TestIsProperPlatform(t *testing.T) {
 }
 
 func TestNewAwsClientImpl(t *testing.T) {
-	client := NewAwsClientImpl(AwsConfig{})
+	client := NewAwsClientImpl("")
 	if client == nil {
 		t.Errorf("NewAwsClientImpl should not return nil")
 	}
@@ -71,7 +90,7 @@ func TestNewAwsClientImpl(t *testing.T) {
 func TestAwsGetInstanceIdentityDocument(t *testing.T) {
 	testCases := map[string]struct {
 		sigFile              string
-		requestPath          string
+		doc                  string
 		expectedErr          string
 		expectedInstanceType string
 		expectedRegion       string
@@ -79,7 +98,7 @@ func TestAwsGetInstanceIdentityDocument(t *testing.T) {
 	}{
 		"Good Identity": {
 			sigFile:              "testdata/sig.pem",
-			requestPath:          "/latest/dynamic/instance-identity/pkcs7",
+			doc:                  doc,
 			expectedErr:          "",
 			expectedInstanceType: "c3.large",
 			expectedRegion:       "us-west-2",
@@ -97,10 +116,10 @@ func TestAwsGetInstanceIdentityDocument(t *testing.T) {
 		sigBytes, err := ioutil.ReadFile(c.sigFile)
 		assert.Equal(t, err, nil, fmt.Sprintf("%v: Unable to read file %s", id, c.sigFile))
 
-		server := initTestServer(
-			c.requestPath,
-			sigBytes,
-		)
+		server := initTestServer(map[string][]byte{
+			"/latest/dynamic/instance-identity/document":  []byte(c.doc),
+			"/latest/dynamic/instance-identity/signature": sigBytes,
+		})
 		defer server.Close()
 
 		awsc := &AwsClientImpl{
@@ -139,12 +158,14 @@ func TestAwsGetInstanceIdentityDocument(t *testing.T) {
 func TestAwsGetServiceIdentity(t *testing.T) {
 	testCases := map[string]struct {
 		sigFile                 string
+		doc                     string
 		requestPath             string
 		expectedErr             string
 		expectedServiceIdentity string
 	}{
 		"Good CredentialTypes": {
 			sigFile:                 "testdata/sig.pem",
+			doc:                     doc,
 			requestPath:             "/latest/dynamic/instance-identity/pkcs7",
 			expectedErr:             "",
 			expectedServiceIdentity: "",
@@ -155,10 +176,10 @@ func TestAwsGetServiceIdentity(t *testing.T) {
 		sigBytes, err := ioutil.ReadFile(c.sigFile)
 		assert.Equal(t, err, nil, fmt.Sprintf("%v: Unable to read file %s", id, c.sigFile))
 
-		server := initTestServer(
-			c.requestPath,
-			sigBytes,
-		)
+		server := initTestServer(map[string][]byte{
+			"/latest/dynamic/instance-identity/document":  []byte(c.doc),
+			"/latest/dynamic/instance-identity/signature": sigBytes,
+		})
 		defer server.Close()
 
 		awsc := &AwsClientImpl{
@@ -170,7 +191,7 @@ func TestAwsGetServiceIdentity(t *testing.T) {
 			t.Fatalf("%s: Unexpected Error: %v", id, err)
 		} else if serviceIdentity != c.expectedServiceIdentity {
 			t.Errorf("%s: Wrong Service Identity. Expected %v, Actual %v", id,
-				string(c.expectedServiceIdentity), string(serviceIdentity))
+				c.expectedServiceIdentity, serviceIdentity)
 		}
 	}
 }
@@ -178,12 +199,14 @@ func TestAwsGetServiceIdentity(t *testing.T) {
 func TestGetGetAgentCredential(t *testing.T) {
 	testCases := map[string]struct {
 		sigFile            string
+		doc                string
 		requestPath        string
 		expectedErr        string
 		expectedCredential string
 	}{
 		"Good Identity": {
 			sigFile:     "testdata/sig.pem",
+			doc:         doc,
 			requestPath: "/latest/dynamic/instance-identity/pkcs7",
 			expectedErr: "",
 			expectedCredential: "\"ewogICJkZXZwYXlQcm9kdWN0Q29kZXMiIDogbnVsbCwKICAicHJpdmF0ZUlwIiA6ICIx" +
@@ -200,10 +223,10 @@ func TestGetGetAgentCredential(t *testing.T) {
 		sigBytes, err := ioutil.ReadFile(c.sigFile)
 		assert.Equal(t, err, nil, fmt.Sprintf("%v: Unable to read file %s", id, c.sigFile))
 
-		server := initTestServer(
-			c.requestPath,
-			sigBytes,
-		)
+		server := initTestServer(map[string][]byte{
+			"/latest/dynamic/instance-identity/document":  []byte(c.doc),
+			"/latest/dynamic/instance-identity/signature": sigBytes,
+		})
 		defer server.Close()
 
 		awsc := &AwsClientImpl{
@@ -236,53 +259,27 @@ func TestAwsGetDialOptions(t *testing.T) {
 	}
 
 	testCases := map[string]struct {
-		sigFile         string
-		requestPath     string
 		expectedErr     string
-		cfg             *ClientConfig
+		rootCertFile    string
 		expectedOptions []grpc.DialOption
 	}{
 		"Good DialOptions": {
-			sigFile:     "testdata/sig.pem",
-			requestPath: "/latest/dynamic/instance-identity/pkcs7",
-			expectedErr: "",
-			cfg: &ClientConfig{
-				AwsConfig: AwsConfig{
-					RootCACertFile: "testdata/cert-chain-good.pem",
-				},
-			},
+			expectedErr:  "",
+			rootCertFile: "testdata/cert-chain-good.pem",
 			expectedOptions: []grpc.DialOption{
 				grpc.WithTransportCredentials(creds),
 			},
 		},
 		"Bad DialOptions": {
-			sigFile:     "testdata/sig.pem",
-			requestPath: "/latest/dynamic/instance-identity/pkcs7",
-			expectedErr: "open testdata/cert-chain-good_not_exist.pem: no such file or directory",
-			cfg: &ClientConfig{
-				AwsConfig: AwsConfig{
-					RootCACertFile: "testdata/cert-chain-good_not_exist.pem",
-				},
-			},
-			expectedOptions: []grpc.DialOption{
-				grpc.WithTransportCredentials(creds),
-			},
+			expectedErr:  "open testdata/cert-chain-good_not_exist.pem: no such file or directory",
+			rootCertFile: "testdata/cert-chain-good_not_exist.pem",
 		},
 	}
 
 	for id, c := range testCases {
-		sigBytes, err := ioutil.ReadFile(c.sigFile)
-		assert.Equal(t, err, nil, fmt.Sprintf("%v: Unable to read file %s", id, c.sigFile))
-
-		server := initTestServer(
-			c.requestPath,
-			sigBytes,
-		)
-		defer server.Close()
-
 		awsc := &AwsClientImpl{
-			config: c.cfg.AwsConfig,
-			client: ec2metadata.New(unit.Session, &aws.Config{Endpoint: aws.String(server.URL + "/latest")}),
+			rootCertFile: c.rootCertFile,
+			client:       ec2metadata.New(unit.Session, &aws.Config{}),
 		}
 
 		options, err := awsc.GetDialOptions()
@@ -301,48 +298,27 @@ func TestAwsGetDialOptions(t *testing.T) {
 			t.Fatalf("%s: Wrong dial options size. Expected %v, Actual %v",
 				id, len(c.expectedOptions), len(options))
 		}
-
-		for index, option := range c.expectedOptions {
-			if reflect.ValueOf(options[index]).Pointer() != reflect.ValueOf(option).Pointer() {
-				t.Errorf("%s: Wrong option found", id)
-			}
-		}
 	}
 }
 
 func TestAwsGetCredentialTypes(t *testing.T) {
 	testCases := map[string]struct {
-		sigFile      string
-		requestPath  string
-		expectedErr  string
 		expectedType string
 	}{
 		"Good CredentialTypes": {
-			sigFile:      "testdata/sig.pem",
-			requestPath:  "/latest/dynamic/instance-identity/pkcs7",
-			expectedErr:  "",
 			expectedType: "aws",
 		},
 	}
 
 	for id, c := range testCases {
-		sigBytes, err := ioutil.ReadFile(c.sigFile)
-		assert.Equal(t, err, nil, fmt.Sprintf("%v: Unable to read file %s", id, c.sigFile))
-
-		server := initTestServer(
-			c.requestPath,
-			sigBytes,
-		)
-		defer server.Close()
-
 		awsc := &AwsClientImpl{
-			client: ec2metadata.New(unit.Session, &aws.Config{Endpoint: aws.String(server.URL + "/latest")}),
+			client: ec2metadata.New(unit.Session, &aws.Config{}),
 		}
 
 		credentialType := awsc.GetCredentialType()
 		if credentialType != c.expectedType {
 			t.Errorf("%s: Wrong Credential Type. Expected %v, Actual %v", id,
-				string(c.expectedType), string(credentialType))
+				c.expectedType, credentialType)
 		}
 	}
 }

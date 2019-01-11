@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package status provides utility functions for RPC status objects.
+// Package status provides utility functions for google_rpc status objects.
 package status
 
 import (
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
-	rpc "github.com/googleapis/googleapis/google/rpc"
-	me "github.com/hashicorp/go-multierror"
+	rpc "github.com/gogo/googleapis/google/rpc"
 )
 
 // OK represents a status with a code of rpc.OK
@@ -70,39 +67,59 @@ func WithDeadlineExceeded(message string) rpc.Status {
 	return rpc.Status{Code: int32(rpc.DEADLINE_EXCEEDED), Message: message}
 }
 
+// WithUnknown returns an initialized status with the rpc.UNKNOWN code and the given message.
+func WithUnknown(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.UNKNOWN), Message: message}
+}
+
+// WithNotFound returns an initialized status with the rpc.NOT_FOUND code and the given message.
+func WithNotFound(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.NOT_FOUND), Message: message}
+}
+
+// WithAlreadyExists returns an initialized status with the rpc.ALREADY_EXISTS code and the given message.
+func WithAlreadyExists(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.ALREADY_EXISTS), Message: message}
+}
+
+// WithFailedPrecondition returns an initialized status with the rpc.FAILED_PRECONDITION code and the given message.
+func WithFailedPrecondition(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.FAILED_PRECONDITION), Message: message}
+}
+
+// WithAborted returns an initialized status with the rpc.ABORTED code and the given message.
+func WithAborted(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.ABORTED), Message: message}
+}
+
+// WithOutOfRange returns an initialized status with the rpc.OUT_OF_RANGE code and the given message.
+func WithOutOfRange(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.OUT_OF_RANGE), Message: message}
+}
+
+// WithUnimplemented returns an initialized status with the rpc.UNIMPLEMENTED code and the given message.
+func WithUnimplemented(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.UNIMPLEMENTED), Message: message}
+}
+
+// WithUnavailable returns an initialized status with the rpc.UNAVAILABLE code and the given message.
+func WithUnavailable(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.UNAVAILABLE), Message: message}
+}
+
+// WithDataLoss returns an initialized status with the rpc.DATA_LOSS code and the given message.
+func WithDataLoss(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.DATA_LOSS), Message: message}
+}
+
+// WithUnauthenticated returns an initialized status with the rpc.UNAUTHENTICATED code and the given message.
+func WithUnauthenticated(message string) rpc.Status {
+	return rpc.Status{Code: int32(rpc.UNAUTHENTICATED), Message: message}
+}
+
 // IsOK returns true is the given status has the code rpc.OK
 func IsOK(status rpc.Status) bool {
 	return status.Code == int32(rpc.OK)
-}
-
-// InvalidWithDetails builds a google.rpc.Status proto with the provided
-// message and the `details` field populated with the supplied proto message.
-// NOTE: if there is an issue marshaling the proto to a google.protobuf.Any,
-// the returned Status message will not have the `details` field populated.
-func InvalidWithDetails(msg string, pb proto.Message) rpc.Status {
-	invalid := WithInvalidArgument(msg)
-	if any, err := types.MarshalAny(pb); err == nil {
-		invalid.Details = []*types.Any{any}
-	}
-	return invalid
-}
-
-// NewBadRequest builds a google.rpc.BadRequest proto. BadRequest proto messages
-// can be used to populate the `details` field in a google.rpc.Status message.
-func NewBadRequest(field string, err error) *rpc.BadRequest {
-	fvs := make([]*rpc.BadRequest_FieldViolation, 0, 1) // alloc for at least one
-	switch err.(type) {
-	case *me.Error:
-		merr := err.(*me.Error)
-		for _, e := range merr.Errors {
-			fv := &rpc.BadRequest_FieldViolation{Field: field, Description: e.Error()}
-			fvs = append(fvs, fv)
-		}
-	default:
-		fv := &rpc.BadRequest_FieldViolation{Field: field, Description: err.Error()}
-		fvs = append(fvs, fv)
-	}
-	return &rpc.BadRequest{FieldViolations: fvs}
 }
 
 // String produces a string representation of rpc.Status.

@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// nolint: lll
+//go:generate $GOPATH/src/istio.io/istio/bin/mixer_codegen.sh -a mixer/adapter/denier/config/config.proto -x "-n denier -t checknothing -t listentry -t quota"
+
+// Package denier provides an adapter that will return a status code (typically
+// FAILED_PRECONDITION) for all calls. It implements the checkNothing, quota and
+// listEntry templates.
 package denier // import "istio.io/istio/mixer/adapter/denier"
 
 // NOTE: This adapter will eventually be auto-generated so that it automatically supports all CHECK and QUOTA
@@ -21,10 +27,11 @@ import (
 	"context"
 	"time"
 
-	rpc "github.com/googleapis/googleapis/google/rpc"
+	rpc "github.com/gogo/googleapis/google/rpc"
 
 	"istio.io/istio/mixer/adapter/denier/config"
 	"istio.io/istio/mixer/pkg/adapter"
+	"istio.io/istio/mixer/pkg/status"
 	"istio.io/istio/mixer/template/checknothing"
 	"istio.io/istio/mixer/template/listentry"
 	"istio.io/istio/mixer/template/quota"
@@ -36,7 +43,7 @@ type handler struct {
 
 func defaultParam() *config.Params {
 	return &config.Params{
-		Status:        rpc.Status{Code: int32(rpc.FAILED_PRECONDITION)},
+		Status:        status.New(rpc.FAILED_PRECONDITION),
 		ValidDuration: 5 * time.Second,
 		ValidUseCount: 1000,
 	}

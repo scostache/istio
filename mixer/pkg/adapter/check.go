@@ -18,12 +18,11 @@ import (
 	"fmt"
 	"time"
 
-	rpc "github.com/googleapis/googleapis/google/rpc"
+	rpc "github.com/gogo/googleapis/google/rpc"
 
+	mixerpb "istio.io/api/mixer/v1"
 	"istio.io/istio/mixer/pkg/status"
 )
-
-// TODO revisit the comment on this adapter struct.
 
 // CheckResult provides return value from check request call on the handler.
 type CheckResult struct {
@@ -33,30 +32,15 @@ type CheckResult struct {
 	ValidDuration time.Duration
 	// ValidUseCount represents the number of uses for which this result can be considered valid.
 	ValidUseCount int32
+	// RouteDirective represents the route directive return result
+	RouteDirective *mixerpb.RouteDirective
 }
 
-// GetStatus gets status embedded in the result.
-func (r *CheckResult) GetStatus() rpc.Status { return r.Status }
-
-// SetStatus embeds status in result.
-func (r *CheckResult) SetStatus(s rpc.Status) { r.Status = s }
-
-// Combine combines other result with self. It does not handle
-// Status.
-func (r *CheckResult) Combine(otherPtr interface{}) interface{} {
-	if otherPtr == nil {
-		return r
-	}
-	other := otherPtr.(*CheckResult)
-	if r.ValidDuration > other.ValidDuration {
-		r.ValidDuration = other.ValidDuration
-	}
-	if r.ValidUseCount > other.ValidUseCount {
-		r.ValidUseCount = other.ValidUseCount
-	}
-	return r
+// IsDefault returns true if the CheckResult is in its zero state
+func (r *CheckResult) IsDefault() bool {
+	return status.IsOK(r.Status) && r.ValidDuration == 0 && r.ValidUseCount == 0 && r.RouteDirective == nil
 }
 
 func (r *CheckResult) String() string {
-	return fmt.Sprintf("CheckResult: status:%s, duration:%d, usecount:%d", status.String(r.Status), r.ValidDuration, r.ValidDuration)
+	return fmt.Sprintf("CheckResult: status:%s, duration:%d, usecount:%d", status.String(r.Status), r.ValidDuration, r.ValidUseCount)
 }

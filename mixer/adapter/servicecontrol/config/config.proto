@@ -14,6 +14,19 @@
 
 syntax = "proto3";
 
+// $title: Service Control
+// $description: Adapter that delivers logs and metrics to Google Service Control.
+// $location: https://istio.io/docs/reference/config/policy-and-telemetry/adapters/servicecontrol.html
+// $supported_templates: servicecontrolreport,quota,apikey
+// $aliases:
+// $  - /docs/reference/config/adapters/servicecontrol.html
+
+// The `servicecontrol` adapter delivers logs and metrics to
+// [Google Service Control](https://cloud.google.com/service-control).
+//
+// This adapter supports the [servicecontrolreport template](https://istio.io/docs/reference/config/policy-and-telemetry/templates/servicecontrolreport/),
+// the [quota template](https://istio.io/docs/reference/config/policy-and-telemetry/templates/quota/),
+// and the [apikey template](https://istio.io/docs/reference/config/policy-and-telemetry/templates/apikey/).
 package adapter.servicecontrol.config;
 
 import "gogoproto/gogo.proto";
@@ -24,7 +37,7 @@ option (gogoproto.goproto_getters_all) = false;
 option (gogoproto.equal_all) = false;
 option (gogoproto.gostring_all) = false;
 
-// Adapter runtime config paramters.
+// Adapter runtime config parameters.
 message RuntimeConfig {
     int32 check_cache_size = 1;
     google.protobuf.Duration check_result_expiration = 2;
@@ -51,8 +64,11 @@ message GcpServiceSetting {
     repeated Quota quotas = 3;
 }
 
+// Configuration format for the `servicecontrol` adapter.
+//
 // Sample adapter config:
-// '''
+//
+// ```yaml
 // apiVersion: "config.istio.io/v1alpha2"
 // kind: servicecontrol
 // metadata:
@@ -70,7 +86,7 @@ message GcpServiceSetting {
 //         - name: ratelimit.quota.istio-system
 //           google_quota_metric_name: read-requests
 //           expiration: 1m
-// '''
+// ```
 message Params {
     RuntimeConfig runtime_config = 1;
     // A path to JSON token file, usually mounted as Kubernetes secret on pod.

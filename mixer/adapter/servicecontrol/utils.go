@@ -20,14 +20,12 @@ import (
 	"fmt"
 	"time"
 
+	rpc "github.com/gogo/googleapis/google/rpc"
 	pbtypes "github.com/gogo/protobuf/types"
-	rpc "github.com/googleapis/googleapis/google/rpc"
 )
 
 const (
 	apiKeyPrefix = "api_key:"
-
-	logDebug = 4
 )
 
 func toRPCCode(responseCode int) rpc.Code {
@@ -150,5 +148,5 @@ func toFormattedJSON(marshaller json.Marshaler) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(out.Bytes()), err
+	return out.String(), err
 }

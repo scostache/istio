@@ -17,6 +17,8 @@ package adapter
 import (
 	"context"
 	"io"
+
+	"istio.io/istio/mixer/pkg/attribute"
 )
 
 type (
@@ -46,5 +48,43 @@ type (
 		// If the returned Handler fails to implement the required interface that builder was registered for, Mixer will
 		// report an error and stop serving runtime traffic to the particular Handler.
 		Build(context.Context, Env) (Handler, error)
+	}
+
+	// EncodedInstance stores byte encoded data with the instance name
+	EncodedInstance struct {
+		Name string
+		Data []byte
+	}
+
+	// RemoteGenerateAttributesHandler calls remote APA adapter
+	RemoteGenerateAttributesHandler interface {
+		Handler
+
+		// HandleRemoteGenAttrs performs APA call based on pre encoded instances and returns the decoded output into an attribute bag.
+		HandleRemoteGenAttrs(ctx context.Context, encodedInstance *EncodedInstance, out *attribute.MutableBag) error
+	}
+
+	// RemoteCheckHandler calls remote check adapter.
+	RemoteCheckHandler interface {
+		Handler
+
+		// HandleRemoteCheck performs check call based on pre a encoded instance.
+		HandleRemoteCheck(ctx context.Context, encodedInstance *EncodedInstance, out *attribute.MutableBag, outPrefix string) (*CheckResult, error)
+	}
+
+	// RemoteReportHandler calls remote report adapter.
+	RemoteReportHandler interface {
+		Handler
+
+		// HandleRemoteReport performs report call based on pre encoded instances.
+		HandleRemoteReport(ctx context.Context, encodedInstances []*EncodedInstance) error
+	}
+
+	// RemoteQuotaHandler calls remote report adapter.
+	RemoteQuotaHandler interface {
+		Handler
+
+		// HandleRemoteQuota performs quota call based on pre encoded instances.
+		HandleRemoteQuota(ctx context.Context, encodedInstance *EncodedInstance, args *QuotaArgs) (*QuotaResult, error)
 	}
 )

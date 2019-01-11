@@ -17,26 +17,21 @@ package perf
 import (
 	"testing"
 
-	"istio.io/api/mixer/v1"
+	istio_mixer_v1 "istio.io/api/mixer/v1"
 )
 
 func TestBasicReportRequest(t *testing.T) {
-	config := Config{
-		IdentityAttribute:       "identityAttr",
-		IdentityAttributeDomain: "identityAttrDomain",
-	}
-	report := BasicReport{
-		Attributes: map[string]interface{}{
-			"foo": "bar",
-		},
-	}
+	report := BuildBasicReport(map[string]interface{}{
+		"foo": "bar",
+		"baz": int64(42),
+	})
 
-	protos := report.createRequestProtos(config)
-	if len(protos) != 1 {
+	proto := report.getRequestProto()
+	if proto == nil {
 		t.Fatalf("should have created 1 proto")
 	}
 
-	actual, ok := protos[0].(*istio_mixer_v1.ReportRequest)
+	actual, ok := proto.(*istio_mixer_v1.ReportRequest)
 	if !ok {
 		t.Fatalf("should have created a ReportRequest proto")
 	}
@@ -44,11 +39,19 @@ func TestBasicReportRequest(t *testing.T) {
 	if len(actual.Attributes) != 1 {
 		t.Fatalf("should have 1 set of attributes")
 	}
-	if len(actual.Attributes[0].Words) != 4 {
-		t.Fatalf("should have 4 words")
+	if len(actual.Attributes[0].Words) != 3 {
+		t.Fatalf("got %v, should have 3 words", actual.Attributes[0].Words)
 	}
-	if len(actual.Attributes[0].Strings) != 2 {
-		t.Fatalf("should have two strings")
+	if len(actual.Attributes[0].Strings) != 1 {
+		t.Fatalf("got %v, should have one string", actual.Attributes[0].Strings)
+	}
+	if len(actual.Attributes[0].Int64S) != 1 {
+		t.Fatalf("should have 1 integers")
+	}
+	for _, v := range actual.Attributes[0].Int64S {
+		if v != int64(42) {
+			t.Fatal("The single int64 attribute should have been 42")
+		}
 	}
 	actualMap := make(map[string]string)
 	for k, v := range actual.Attributes[0].Strings {
@@ -60,22 +63,14 @@ func TestBasicReportRequest(t *testing.T) {
 	if actualMap["foo"] != "bar" {
 		t.Fail()
 	}
-	if actualMap["identityAttr"] != "identityAttrDomain" {
-		t.Fail()
-	}
 }
 
 func TestBasicCheckRequest(t *testing.T) {
-	config := Config{
-		IdentityAttribute:       "identityAttr",
-		IdentityAttributeDomain: "identityAttrDomain",
-	}
-	report := BasicCheck{
-		Attributes: map[string]interface{}{
+	report := BuildBasicCheck(
+		map[string]interface{}{
 			"foo": "bar",
 		},
-
-		Quotas: map[string]istio_mixer_v1.CheckRequest_QuotaParams{
+		map[string]istio_mixer_v1.CheckRequest_QuotaParams{
 			"zoo": {
 				BestEffort: true,
 				Amount:     43,
@@ -84,24 +79,23 @@ func TestBasicCheckRequest(t *testing.T) {
 				BestEffort: false,
 				Amount:     23,
 			},
-		},
-	}
+		})
 
-	protos := report.createRequestProtos(config)
-	if len(protos) != 1 {
+	proto := report.getRequestProto()
+	if proto == nil {
 		t.Fatalf("should have created 1 proto")
 	}
 
-	actual, ok := protos[0].(*istio_mixer_v1.CheckRequest)
+	actual, ok := proto.(*istio_mixer_v1.CheckRequest)
 	if !ok {
 		t.Fatalf("should have created a CheckRequest proto")
 	}
 
-	if len(actual.Attributes.Words) != 4 {
-		t.Fatalf("should have 4 words")
+	if len(actual.Attributes.Words) != 2 {
+		t.Fatalf("should have 2 words")
 	}
-	if len(actual.Attributes.Strings) != 2 {
-		t.Fatalf("should have two strings")
+	if len(actual.Attributes.Strings) != 1 {
+		t.Fatalf("should have one string")
 	}
 	actualMap := make(map[string]string)
 	for k, v := range actual.Attributes.Strings {
@@ -111,9 +105,6 @@ func TestBasicCheckRequest(t *testing.T) {
 	}
 
 	if actualMap["foo"] != "bar" {
-		t.Fail()
-	}
-	if actualMap["identityAttr"] != "identityAttrDomain" {
 		t.Fail()
 	}
 

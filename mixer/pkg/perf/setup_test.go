@@ -16,185 +16,77 @@ package perf
 
 import (
 	"fmt"
-	"strings"
+	"reflect"
 	"testing"
 
-	"istio.io/api/mixer/v1"
+	istio_mixer_v1 "istio.io/api/mixer/v1"
 )
 
 var tests = []struct {
-	yaml  string
-	setup Setup
+	load Load
 }{
 	{
-		yaml: `
-config:
-  global: global
-  identityAttribute: identityAttr
-  identityAttributeDomain: identityAttrDomain
-  rpcServer: rpcServer
-load: {}
-`,
-		setup: Setup{
-			Config: Config{
-				Global:                  "global",
-				Service:                 "rpcServer",
-				IdentityAttribute:       "identityAttr",
-				IdentityAttributeDomain: "identityAttrDomain",
-			},
-			Load: Load{},
+		load: Load{
+			Requests: []Request{},
 		},
 	},
-
 	{
-		yaml: `
-config:
-  global: global
-  identityAttribute: identityAttr
-  identityAttributeDomain: identityAttrDomain
-  rpcServer: rpcServer
-load:
-  iterations: 2
-  randomSeed: 123
-  requests:
-  - attributes:
-     baz: 42
-     foo: bar
-    type: basicReport
-  - attributes:
-     bar: baz
-     foo: 23
-    quotas:
-     q1:
-       amount: 23
-       best_effort: true
-     q2:
-       amount: 54
-    type: basicCheck
-  stableOrder: true
-  `,
-		setup: Setup{
-			Config: Config{
-				Global:                  "global",
-				Service:                 "rpcServer",
-				IdentityAttribute:       "identityAttr",
-				IdentityAttributeDomain: "identityAttrDomain",
-			},
-			Load: Load{
-				Multiplier:  2,
-				StableOrder: true,
-				RandomSeed:  123,
-				Requests: []Request{
-					BasicReport{
-						Attributes: map[string]interface{}{
-							"foo": "bar",
-							"baz": 42,
-						},
+		Load{
+			Multiplier:  2,
+			StableOrder: true,
+			RandomSeed:  123,
+			Requests: []Request{
+				BuildBasicReport(
+					map[string]interface{}{
+						"foo": "bar",
+						"baz": int64(42),
+					}),
+				BuildBasicCheck(
+					map[string]interface{}{
+						"bar": "baz",
+						"foo": int64(23),
 					},
-					BasicCheck{
-						Attributes: map[string]interface{}{
-							"bar": "baz",
-							"foo": 23,
+					map[string]istio_mixer_v1.CheckRequest_QuotaParams{
+						"q1": {
+							Amount:     23,
+							BestEffort: true,
 						},
-						Quotas: map[string]istio_mixer_v1.CheckRequest_QuotaParams{
-							"q1": {
-								Amount:     23,
-								BestEffort: true,
-							},
-							"q2": {
-								Amount:     54,
-								BestEffort: false,
-							},
+						"q2": {
+							Amount:     54,
+							BestEffort: false,
 						},
-					},
-				},
+					}),
 			},
 		},
 	},
-
 	{
-		yaml: `
-config:
-  global: global
-  identityAttribute: destination.rpcServer
-  identityAttributeDomain: svc.cluster.local
-  rpcServer: rpcServer
-load:
-  iterations: 100
-  requests:
-  - attributes:
-      target.name: somesrvcname
-    type: basicReport
-  - attributes:
-      target.name: cvd
-    type: basicReport
-  - attributes:
-      target.name: somesrvcname
-    type: basicCheck
-`,
-		setup: Setup{
-			Config: Config{
-				Global:                  "global",
-				Service:                 "rpcServer",
-				IdentityAttribute:       `destination.rpcServer`,
-				IdentityAttributeDomain: `svc.cluster.local`,
-			},
-
-			Load: Load{
-				Multiplier: 100,
-				Requests: []Request{
-					BasicReport{
-						Attributes: map[string]interface{}{"target.name": "somesrvcname"},
-					},
-					BasicReport{
-						Attributes: map[string]interface{}{"target.name": "cvd"},
-					},
-					BasicCheck{
-						Attributes: map[string]interface{}{
-							"target.name": "somesrvcname",
-						},
-					},
-				},
+		load: Load{
+			Multiplier: 100,
+			Requests: []Request{
+				BuildBasicReport(map[string]interface{}{"destination.name": "somesrvcname"}),
+				BuildBasicReport(map[string]interface{}{"destination.name": "cvd"}),
+				BuildBasicCheck(map[string]interface{}{"destination.name": "somesrvcname"}, nil),
 			},
 		},
 	},
-}
-
-func TestSetupToYaml(t *testing.T) {
-	for i, test := range tests {
-		name := fmt.Sprintf("%d", i)
-		t.Run(name, func(tt *testing.T) {
-			actualBytes, err := marshallSetup(&test.setup)
-			if err != nil {
-				tt.Fatalf("Unexpected error: %v", err)
-			}
-			actual := string(actualBytes)
-			actCmp := strings.TrimSpace(strings.Replace(actual, " ", "", -1))
-			expCmp := strings.TrimSpace(strings.Replace(test.yaml, " ", "", -1))
-			if actCmp != expCmp {
-				tt.Fatalf("mismatch: '%v' != '%v'\n", actual, test.yaml)
-			}
-		})
-	}
 }
 
 func TestRoundtrip(t *testing.T) {
 	for i, test := range tests {
 		name := fmt.Sprintf("%d", i)
 		t.Run(name, func(tt *testing.T) {
-			var actual Setup
-			if err := unmarshallSetup([]byte(test.yaml), &actual); err != nil {
+			loadBytes, err := marshallLoad(&test.load)
+			if err != nil {
 				tt.Fatalf("Unexpected error: %v", err)
 			}
-			actualBytes, err := marshallSetup(&actual)
-			if err != nil {
-				tt.Fatalf("unexpected marshal error: %v", err)
+
+			var loadCmp Load
+			if err := unmarshallLoad(loadBytes, &loadCmp); err != nil {
+				tt.Fatalf("Unexpected error: %v", err)
 			}
-			actualString := string(actualBytes)
-			actCmp := strings.TrimSpace(strings.Replace(actualString, " ", "", -1))
-			expCmp := strings.TrimSpace(strings.Replace(test.yaml, " ", "", -1))
-			if actCmp != expCmp {
-				tt.Fatalf("mismatch: '%v' != '%v'\n", actualString, test.yaml)
+
+			if !reflect.DeepEqual(test.load, loadCmp) {
+				tt.Fatalf("mismatch: '%v' != '%v'\n", test.load, loadCmp)
 			}
 		})
 	}
@@ -215,35 +107,32 @@ func TestMarshallRequestError(t *testing.T) {
 func TestUnmarshal_Errors(t *testing.T) {
 	var configs = []string{
 		`
-load:
-  stableOrder: AAAA
+stableOrder: AAAA
 `,
 
 		`
-load:
-  requests:
-    - type:
-      - a: b
+
+requests:
+  - type:
+    - a: b
 `,
 
 		`
-load:
-  requests:
-    - type: boo
+requests:
+  - type: boo
 `,
 
 		`
-load:
-  requests:
-    - type: report
-      attributes: 23
+requests:
+  - type: report
+    attributes: 23
 `,
 	}
 
 	for i, config := range configs {
-		var setup Setup
+		var load Load
 		t.Run(fmt.Sprintf("%d", i), func(tt *testing.T) {
-			if err := unmarshallSetup([]byte(config), &setup); err == nil {
+			if err := unmarshallLoad([]byte(config), &load); err == nil {
 				tt.Fatal("expected error was not thrown")
 			}
 		})
@@ -252,15 +141,16 @@ load:
 
 func TestReportMarshal_Error(t *testing.T) {
 
-	r := &BasicReport{
-		Attributes: map[string]interface{}{
-			"foo": func() {},
-		},
-	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("Marshal logic did not panic")
+		}
+	}()
 
-	if _, err := r.MarshalJSON(); err == nil {
-		t.Fail()
-	}
+	r := BuildBasicReport(map[string]interface{}{
+		"foo": func() {},
+	})
+	r.MarshalJSON()
 }
 
 type BrokenRequest struct {
@@ -272,6 +162,6 @@ func (b *BrokenRequest) MarshalJSON() ([]byte, error) {
 	return nil, fmt.Errorf("marshal error")
 }
 
-func (b *BrokenRequest) createRequestProtos(c Config) []interface{} {
+func (b *BrokenRequest) getRequestProto() interface{} {
 	return nil
 }

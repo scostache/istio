@@ -15,19 +15,26 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
+	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus"
+	ocprom "go.opencensus.io/exporter/prometheus"
+	"go.opencensus.io/stats/view"
+	"google.golang.org/grpc/stats"
 
-	"istio.io/istio/mixer/pkg/version"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/version"
 )
 
 type monitor struct {
 	monitoringServer *http.Server
-	shutdown         chan struct{}
+	// This channel is closed after the server stops serving requests.
+	closed chan struct{}
 }
 
 const (
@@ -35,15 +42,15 @@ const (
 	versionPath = "/version"
 )
 
-func startMonitor(port uint16) (*monitor, error) {
+func startMonitor(port uint16, enableProfiling bool, lf listenFunc) (*monitor, error) {
 	m := &monitor{
-		shutdown: make(chan struct{}),
+		closed: make(chan struct{}),
 	}
 
 	// get the network stuff setup
 	var listener net.Listener
 	var err error
-	if listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port)); err != nil {
+	if listener, err = lf("tcp", fmt.Sprintf(":%d", port)); err != nil {
 		return nil, fmt.Errorf("unable to listen on socket: %v", err)
 	}
 
@@ -52,33 +59,103 @@ func startMonitor(port uint16) (*monitor, error) {
 	// is coming. that design will include proper coverage of statusz/healthz type
 	// functionality, in addition to how mixer reports its own metrics.
 	mux := http.NewServeMux()
-	mux.Handle(metricsPath, promhttp.Handler())
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	registry.MustRegister(prometheus.NewGoCollector())
+
+	exporter, err := ocprom.NewExporter(ocprom.Options{Registry: registry})
+	if err != nil {
+		return nil, fmt.Errorf("could not set up prometheus exporter: %v", err)
+	}
+	view.RegisterExporter(exporter)
+	mux.Handle(metricsPath, exporter)
+
 	mux.HandleFunc(versionPath, func(out http.ResponseWriter, req *http.Request) {
 		if _, err := out.Write([]byte(version.Info.String())); err != nil {
 			log.Errorf("Unable to write version string: %v", err)
 		}
 	})
 
+	version.Info.RecordComponentBuildTag("mixer")
+
+	if enableProfiling {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+
 	m.monitoringServer = &http.Server{
 		Handler: mux,
 	}
 
 	go func() {
-		m.shutdown <- struct{}{}
 		_ = m.monitoringServer.Serve(listener)
-		m.shutdown <- struct{}{}
+		close(m.closed)
 	}()
-
-	// This is here to work around (mostly) a race condition in the Serve
-	// function. If the Close method is called before or during the execution of
-	// Serve, the call may be ignored and Serve never returns.
-	<-m.shutdown
 
 	return m, nil
 }
 
 func (m *monitor) Close() error {
-	err := m.monitoringServer.Close()
-	<-m.shutdown
+	var err error
+
+	// This works around a race condition between Serve() and Close() functions.
+	// If Close() is called before Serve(), Serve() never returns.
+	// m.closed channel is used by Serve() to indicate that is has processed the Close signal
+	// and exited the function. Until Serve() exists, Close() periodically issues monitoringServer.Close().
+
+L:
+	for {
+		err = m.monitoringServer.Close()
+		select {
+		case <-m.closed:
+			break L
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 	return err
+}
+
+type multiStatsHandler struct {
+	handlers []stats.Handler
+}
+
+// HandleRPC processes the RPC stats.
+func (m *multiStatsHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
+	for _, h := range m.handlers {
+		h.HandleRPC(ctx, rs)
+	}
+}
+
+// TagRPC can attach some information to the given context.
+func (m *multiStatsHandler) TagRPC(ctx context.Context, rti *stats.RPCTagInfo) context.Context {
+	c := ctx
+	for _, h := range m.handlers {
+		c = h.TagRPC(c, rti)
+	}
+	return c
+}
+
+// TagConn can attach some information to the given context.
+func (m *multiStatsHandler) TagConn(ctx context.Context, cti *stats.ConnTagInfo) context.Context {
+	c := ctx
+	for _, h := range m.handlers {
+		c = h.TagConn(c, cti)
+	}
+	return c
+}
+
+// HandleConn processes the Conn stats.
+func (m *multiStatsHandler) HandleConn(ctx context.Context, cs stats.ConnStats) {
+	for _, h := range m.handlers {
+		h.HandleConn(ctx, cs)
+	}
+}
+
+func newMultiStatsHandler(handlers ...stats.Handler) stats.Handler {
+	return &multiStatsHandler{handlers: handlers}
 }

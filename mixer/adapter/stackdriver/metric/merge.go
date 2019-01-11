@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors.
+// Copyright 2017 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,19 +40,14 @@ func merge(series []*monitoring.TimeSeries, logger adapter.Logger) []*monitoring
 func groupBySeries(series []*monitoring.TimeSeries) map[uint64][]*monitoring.TimeSeries {
 	bySeries := make(map[uint64][]*monitoring.TimeSeries)
 	for _, ts := range series {
-		for _, ts := range series {
-			if ts.MetricKind == metricpb.MetricDescriptor_DELTA || ts.MetricKind == metricpb.MetricDescriptor_CUMULATIVE {
-				// DELTA and CUMULATIVE metrics cannot have the same start and end time, so if they are the same we munge
-				// the data by unit of least precision that Stackdriver stores (microsecond).
-				if compareUSec(ts.Points[0].Interval.StartTime, ts.Points[0].Interval.EndTime) == 0 {
-					ts.Points[0].Interval.EndTime = &timestamp.Timestamp{
-						Seconds: ts.Points[0].Interval.EndTime.Seconds,
-						Nanos:   ts.Points[0].Interval.EndTime.Nanos + usec,
-					}
+		if ts.MetricKind == metricpb.MetricDescriptor_DELTA || ts.MetricKind == metricpb.MetricDescriptor_CUMULATIVE {
+			// DELTA and CUMULATIVE metrics cannot have the same start and end time, so if they are the same we munge
+			// the data by unit of least precision that Stackdriver stores (microsecond).
+			if compareUSec(ts.Points[0].Interval.StartTime, ts.Points[0].Interval.EndTime) == 0 {
+				ts.Points[0].Interval.EndTime = &timestamp.Timestamp{
+					Seconds: ts.Points[0].Interval.EndTime.Seconds,
+					Nanos:   ts.Points[0].Interval.EndTime.Nanos + usec,
 				}
-				// Stackdriver doesn't allow DELTA custom metrics, but queries over CUMULATIVE data without overlapping time
-				// intervals have the same semantics as DELTA metrics. So we change DELTAs to CUMULATIVE to get through the API front door.
-				ts.MetricKind = metricpb.MetricDescriptor_CUMULATIVE
 			}
 		}
 		k := toKey(ts.Metric, ts.Resource)
@@ -100,13 +95,13 @@ func mergePoints(a, b *monitoring.TimeSeries) (*monitoring.TimeSeries, error) {
 		if bv, ok = b.Points[0].Value.Value.(*monitoring.TypedValue_Int64Value); !ok {
 			return a, fmt.Errorf("can't merge two timeseries with different value types; a has int64 value, b does not: %#v", b.Points[0].Value)
 		}
-		a.Points[0].Value = &monitoring.TypedValue{&monitoring.TypedValue_Int64Value{av.Int64Value + bv.Int64Value}}
+		a.Points[0].Value = &monitoring.TypedValue{Value: &monitoring.TypedValue_Int64Value{Int64Value: av.Int64Value + bv.Int64Value}}
 	case *monitoring.TypedValue_DoubleValue:
 		var bv *monitoring.TypedValue_DoubleValue
 		if bv, ok = b.Points[0].Value.Value.(*monitoring.TypedValue_DoubleValue); !ok {
 			return a, fmt.Errorf("can't merge two timeseries with different value types; a has double value, b does not: %#v", b.Points[0].Value)
 		}
-		a.Points[0].Value = &monitoring.TypedValue{&monitoring.TypedValue_DoubleValue{av.DoubleValue + bv.DoubleValue}}
+		a.Points[0].Value = &monitoring.TypedValue{Value: &monitoring.TypedValue_DoubleValue{DoubleValue: av.DoubleValue + bv.DoubleValue}}
 	case *monitoring.TypedValue_DistributionValue:
 		var bv *monitoring.TypedValue_DistributionValue
 		if bv, ok = b.Points[0].Value.Value.(*monitoring.TypedValue_DistributionValue); !ok {
