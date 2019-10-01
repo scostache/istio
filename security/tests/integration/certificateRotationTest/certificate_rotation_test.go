@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/security/pkg/k8s/controller"
 	"istio.io/istio/security/tests/integration"
 	"istio.io/istio/tests/integration_old/framework"
+	"istio.io/pkg/log"
 )
 
 const (
@@ -44,7 +44,7 @@ var (
 
 func TestCertificateRotation(t *testing.T) {
 	// Create Istio CA with short lifetime certificates
-	initialSecret, err := integration.WaitForSecretExist(testEnv.ClientSet, testEnv.NameSpace, "istio.default",
+	initialSecret, err := integration.WaitForSecretExist(testEnv.ClientSet, testEnv.Namespace, "istio.default",
 		secretWaitTime)
 	if err != nil {
 		t.Error(err)
@@ -60,10 +60,10 @@ func TestCertificateRotation(t *testing.T) {
 		if i > 0 {
 			t.Logf("checking certificate rotation in %v seconds", term)
 			time.Sleep(time.Duration(term) * time.Second)
-			term = term * 2
+			term *= 2
 		}
 
-		secret, err := integration.WaitForSecretExist(testEnv.ClientSet, testEnv.NameSpace, "istio.default",
+		secret, err := integration.WaitForSecretExist(testEnv.ClientSet, testEnv.Namespace, "istio.default",
 			secretWaitTime)
 		if err != nil {
 			continue

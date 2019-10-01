@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,11 @@ type buffered struct {
 	m      sync.Mutex
 	buffer []*monitoringpb.TimeSeries
 
+	// Guards merged time series
+	tsm          sync.Mutex
+	mergeTrigger int
+	mergedTS     map[uint64]*monitoringpb.TimeSeries
+
 	// retryBuffer holds timeseries that fail in push.
 	retryBuffer []*monitoringpb.TimeSeries
 	// retryCounter maps a timeseries to the attempts that it has been retried.
@@ -59,6 +65,8 @@ type buffered struct {
 	timeSeriesBatchSize int
 	retryLimit          int
 	pushInterval        time.Duration
+
+	env adapter.Env
 }
 
 // batchTimeSeries slices the given time series array with respect to the given batch size limit.
@@ -74,10 +82,16 @@ func batchTimeSeries(series []*monitoringpb.TimeSeries, tsLimit int) [][]*monito
 	return batches
 }
 
-func (b *buffered) start(env adapter.Env, ticker *time.Ticker) {
+func (b *buffered) start(env adapter.Env, ticker *time.Ticker, quit chan struct{}) {
 	env.ScheduleDaemon(func() {
-		for range ticker.C {
-			b.Send()
+		for {
+			select {
+			case <-ticker.C:
+				b.mergeTimeSeries()
+				b.Send()
+			case <-quit:
+				return
+			}
 		}
 	})
 }
@@ -85,24 +99,55 @@ func (b *buffered) start(env adapter.Env, ticker *time.Ticker) {
 func (b *buffered) Record(toSend []*monitoringpb.TimeSeries) {
 	b.m.Lock()
 	b.buffer = append(b.buffer, toSend...)
+	if len(b.buffer) >= b.mergeTrigger {
+		// pull the trigger to merge buffered time series
+		b.env.ScheduleWork(func() {
+			b.mergeTimeSeries()
+		})
+	}
 	// TODO: gauge metric reporting how many bytes/timeseries we're holding right now
 	b.m.Unlock()
 }
 
-func (b *buffered) Send() {
+func (b *buffered) mergeTimeSeries() {
 	b.m.Lock()
-	if len(b.buffer) == 0 && len(b.retryBuffer) == 0 {
-		b.m.Unlock()
+	temp := b.buffer
+	b.buffer = make([]*monitoringpb.TimeSeries, 0, len(temp))
+	b.m.Unlock()
+
+	b.tsm.Lock()
+	for _, ts := range temp {
+		k := toKey(ts.Metric, ts.Resource)
+		if p, ok := b.mergedTS[k]; !ok {
+			b.mergedTS[k] = ts
+		} else {
+			if n, err := mergePoints(p, ts); err != nil {
+				b.l.Warningf("failed to merge time series %v and %v: %v", p, ts, err)
+			} else {
+				b.mergedTS[k] = n
+			}
+		}
+	}
+	b.tsm.Unlock()
+}
+
+func (b *buffered) Send() {
+	b.tsm.Lock()
+	if len(b.mergedTS) == 0 && len(b.retryBuffer) == 0 {
+		b.tsm.Unlock()
 		b.l.Debugf("No data to send to Stackdriver.")
 		return
 	}
 
-	toSend := b.buffer
-	b.buffer = make([]*monitoringpb.TimeSeries, 0, len(toSend))
-	b.m.Unlock()
+	tmpBuffer := b.mergedTS
+	b.mergedTS = make(map[uint64]*monitoringpb.TimeSeries)
+	b.tsm.Unlock()
 
-	mergedToSend := merge(toSend, b.l)
-	merged := append(b.retryBuffer, mergedToSend...)
+	toSend := make([]*monitoringpb.TimeSeries, 0, len(tmpBuffer))
+	for _, v := range tmpBuffer {
+		toSend = append(toSend, v)
+	}
+	merged := append(b.retryBuffer, toSend...)
 	b.retryBuffer = make([]*monitoringpb.TimeSeries, 0, len(b.retryBuffer))
 	batches := batchTimeSeries(merged, b.timeSeriesBatchSize)
 	// Spread monitoring API calls evenly over the push interval.
@@ -122,7 +167,12 @@ func (b *buffered) Send() {
 		if err != nil {
 			ets := handleError(err, timeSeries)
 			b.updateRetryBuffer(ets)
-			_ = b.l.Errorf("Stackdriver returned: %v\nGiven data: %v", err, timeSeries)
+			b.l.Errorf("%d time series was sent and Stackdriver returned: %v\n", len(timeSeries), err) // nolint: errcheck
+			if isOutOfOrderError(err) {
+				b.l.Debugf("Given data: %v", timeSeries)
+			} else {
+				b.l.Errorf("Given data: %v", timeSeries) // nolint: errcheck
+			}
 		} else {
 			b.l.Debugf("Successfully sent data to Stackdriver.")
 		}
@@ -143,7 +193,7 @@ func (b *buffered) Close() error {
 // handleError extract out timeseries that fails to create from response status.
 // If no sepecific timeseries listed in error response, retry all time series in batch.
 func handleError(err error, tsSent []*monitoringpb.TimeSeries) []*monitoringpb.TimeSeries {
-	errorTS := make([]*monitoringpb.TimeSeries, 0, 0)
+	errorTS := make([]*monitoringpb.TimeSeries, 0)
 	retryAll := true
 	s, ok := status.FromError(err)
 	if !ok {
@@ -160,9 +210,7 @@ func handleError(err error, tsSent []*monitoringpb.TimeSeries) []*monitoringpb.T
 		}
 	}
 	if isRetryable(status.Code(err)) && retryAll {
-		for _, ts := range tsSent {
-			errorTS = append(errorTS, ts)
-		}
+		errorTS = append(errorTS, tsSent...)
 	}
 	return errorTS
 }
@@ -193,6 +241,15 @@ func isRetryable(c codes.Code) bool {
 	switch c {
 	case codes.Canceled, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Aborted, codes.Internal, codes.Unavailable:
 		return true
+	}
+	return false
+}
+
+func isOutOfOrderError(err error) bool {
+	if s, ok := status.FromError(err); ok {
+		if strings.Contains(strings.ToLower(s.Message()), "order") {
+			return true
+		}
 	}
 	return false
 }

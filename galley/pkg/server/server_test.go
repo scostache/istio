@@ -15,153 +15,61 @@
 package server
 
 import (
-	"errors"
-	"net"
-	"sync"
+	"io/ioutil"
+	"os"
+	"path"
 	"testing"
-	"time"
 
-	"istio.io/istio/galley/pkg/kube"
-	"istio.io/istio/galley/pkg/kube/converter"
-	"istio.io/istio/galley/pkg/meshconfig"
-	kube_meta "istio.io/istio/galley/pkg/metadata/kube"
-	"istio.io/istio/galley/pkg/runtime"
-	"istio.io/istio/galley/pkg/testing/mock"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/mcp/server"
-	mcptestmon "istio.io/istio/pkg/mcp/testing/monitoring"
+	. "github.com/onsi/gomega"
+
+	"istio.io/istio/galley/pkg/server/settings"
 )
 
-func TestNewServer_Errors(t *testing.T) {
+func TestServer(t *testing.T) {
+	g := NewGomegaWithT(t)
 
-loop:
-	for i := 0; ; i++ {
-		p := defaultPatchTable()
-		mk := mock.NewKube()
-		p.newKubeFromConfigFile = func(string) (kube.Interfaces, error) { return mk, nil }
-		p.newSource = func(kube.Interfaces, time.Duration, *kube.Schema, *converter.Config) (runtime.Source, error) {
-			return runtime.NewInMemorySource(), nil
-		}
-		p.newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return meshconfig.NewInMemory(), nil }
-		p.fsNew = func(string, *kube.Schema, *converter.Config) (runtime.Source, error) {
-			return runtime.NewInMemorySource(), nil
-		}
-		p.mcpMetricReporter = func(string) server.Reporter {
-			return nil
-		}
+	rootDir, err := ioutil.TempDir(os.TempDir(), t.Name())
+	g.Expect(err).To(BeNil())
 
-		e := errors.New("err")
+	meshDir := path.Join(rootDir, "meshcfg")
+	meshFile := path.Join(meshDir, "mesh.yaml")
+	configDir := path.Join(rootDir, "cfg")
+	accessListDir := path.Join(rootDir, "access")
+	accessListFile := path.Join(accessListDir, "access.yaml")
 
-		args := DefaultArgs()
-		args.APIAddress = "tcp://0.0.0.0:0"
-		args.Insecure = true
+	err = os.Mkdir(meshDir, os.ModePerm)
+	g.Expect(err).To(BeNil())
 
-		switch i {
-		case 0:
-			p.logConfigure = func(*log.Options) error { return e }
-		case 1:
-			p.newKubeFromConfigFile = func(string) (kube.Interfaces, error) { return nil, e }
-		case 2:
-			p.newSource = func(kube.Interfaces, time.Duration, *kube.Schema, *converter.Config) (runtime.Source, error) {
-				return nil, e
-			}
-		case 3:
-			p.netListen = func(network, address string) (net.Listener, error) { return nil, e }
-		case 4:
-			p.newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return nil, e }
-		case 5:
-			args.ConfigPath = "aaa"
-			p.fsNew = func(string, *kube.Schema, *converter.Config) (runtime.Source, error) { return nil, e }
-		default:
-			break loop
-		}
+	err = os.Mkdir(configDir, os.ModePerm)
+	g.Expect(err).To(BeNil())
 
-		_, err := newServer(args, p, false)
-		if err == nil {
-			t.Fatalf("Expected error not found for i=%d", i)
-		}
-	}
-}
+	err = os.Mkdir(accessListDir, os.ModePerm)
+	g.Expect(err).To(BeNil())
 
-func TestNewServer(t *testing.T) {
-	p := defaultPatchTable()
-	mk := mock.NewKube()
-	p.newKubeFromConfigFile = func(string) (kube.Interfaces, error) { return mk, nil }
-	p.newSource = func(kube.Interfaces, time.Duration, *kube.Schema, *converter.Config) (runtime.Source, error) {
-		return runtime.NewInMemorySource(), nil
-	}
-	p.mcpMetricReporter = func(s string) server.Reporter {
-		return mcptestmon.NewInMemoryServerStatsContext()
-	}
-	p.newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return meshconfig.NewInMemory(), nil }
-	p.fsNew = func(string, *kube.Schema, *converter.Config) (runtime.Source, error) {
-		return runtime.NewInMemorySource(), nil
-	}
-	p.verifyResourceTypesPresence = func(kube.Interfaces) error {
-		return nil
-	}
+	err = ioutil.WriteFile(meshFile, nil, os.ModePerm)
+	g.Expect(err).To(BeNil())
 
-	args := DefaultArgs()
-	args.APIAddress = "tcp://0.0.0.0:0"
-	args.Insecure = true
+	a := settings.DefaultArgs()
+	// If the default port is used it may run into conflicts during testing
+	a.IntrospectionOptions.Port = 0
+	a.MeshConfigFile = meshFile
+	a.ConfigPath = configDir
+	a.AccessListFile = accessListFile
+	a.Insecure = true
+	a.ValidationArgs.EnableValidation = false
+	a.ValidationArgs.EnableReconcileWebhookConfiguration = false
+	a.EnableProfiling = true
 
-	typeCount := len(kube_meta.Types.All())
-	tests := []struct {
-		name              string
-		convertK8SService bool
-		wantListeners     int
-	}{
-		{
-			name:          "Simple",
-			wantListeners: typeCount - 1,
-		},
-		{
-			name:              "ConvertK8SService",
-			convertK8SService: true,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			s, err := newServer(args, p, test.convertK8SService)
-			if err != nil {
-				t.Fatalf("Unexpected error creating service: %v", err)
-			}
-			_ = s.Close()
-		})
-	}
-}
+	s := New(a)
 
-func TestServer_Basic(t *testing.T) {
-	p := defaultPatchTable()
-	mk := mock.NewKube()
-	p.newKubeFromConfigFile = func(string) (kube.Interfaces, error) { return mk, nil }
-	p.newSource = func(kube.Interfaces, time.Duration, *kube.Schema, *converter.Config) (runtime.Source, error) {
-		return runtime.NewInMemorySource(), nil
-	}
-	p.mcpMetricReporter = func(s string) server.Reporter {
-		return mcptestmon.NewInMemoryServerStatsContext()
-	}
-	p.newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return meshconfig.NewInMemory(), nil }
-	p.verifyResourceTypesPresence = func(kube.Interfaces) error {
-		return nil
-	}
+	g.Expect(s.Address()).To(BeNil())
 
-	args := DefaultArgs()
-	args.APIAddress = "tcp://0.0.0.0:0"
-	args.Insecure = true
-	s, err := newServer(args, p, false)
-	if err != nil {
-		t.Fatalf("Unexpected error creating service: %v", err)
-	}
+	err = s.Start()
+	g.Expect(err).To(BeNil())
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	g.Expect(s.Address()).NotTo(BeNil())
+	s.Stop()
+	g.Expect(s.Address()).To(BeNil())
 
-	go func() {
-		defer wg.Done()
-		s.Run()
-	}()
-
-	wg.Wait()
-	_ = s.Close()
+	s.Stop() // Do not panic
 }

@@ -1,7 +1,7 @@
 global:
   # Default hub for Istio images.
   # Releases are published to docker hub under 'istio' project.
-  # Daily builds from prow are on gcr.io, and nightly builds from circle on docker.io/istionightly
+  # Daily builds from prow are on gcr.io
   hub: gcr.io/istio-release
 
   # Default tag for Istio images.
@@ -11,3 +11,15 @@ global:
   # local tests require IfNotPresent, to avoid uploading to dockerhub.
   # TODO: Switch to Always as default, and override in the local tests.
   imagePullPolicy: IfNotPresent
+
+certmanager:
+  enabled: false
+
+job:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 50Mi
+    limits:
+      cpu: 100m
+      memory: 200Mi

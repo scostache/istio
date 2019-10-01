@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright 2019 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,15 +28,15 @@ import (
 )
 
 type mockTokenReviewClient struct {
-	id  string
+	id  []string
 	err error
 }
 
-func (c mockTokenReviewClient) ValidateK8sJwt(jwt string) (string, error) {
-	if c.id != "" {
+func (c mockTokenReviewClient) ValidateK8sJwt(jwt string) ([]string, error) {
+	if c.id != nil {
 		return c.id, nil
 	}
-	return "", c.err
+	return nil, c.err
 }
 
 func TestNewKubeJWTAuthenticator(t *testing.T) {
@@ -45,6 +45,7 @@ func TestNewKubeJWTAuthenticator(t *testing.T) {
 	validJWTPath := filepath.Join(tmpdir, "jwt")
 	caCertFileContent := []byte("CACERT")
 	jwtFileContent := []byte("JWT")
+	trustDomain := "testdomain.com"
 	url := "https://server/url"
 	if err := ioutil.WriteFile(validCACertPath, caCertFileContent, 0777); err != nil {
 		t.Errorf("Failed to write to testing CA cert file: %v", err)
@@ -76,7 +77,7 @@ func TestNewKubeJWTAuthenticator(t *testing.T) {
 	}
 
 	for id, tc := range testCases {
-		authenticator, err := NewKubeJWTAuthenticator(url, tc.caCertPath, tc.jwtPath)
+		authenticator, err := NewKubeJWTAuthenticator(url, tc.caCertPath, tc.jwtPath, trustDomain)
 		if len(tc.expectedErrMsg) > 0 {
 			if err == nil {
 				t.Errorf("Case %s: Succeeded. Error expected: %v", id, err)
@@ -89,7 +90,8 @@ func TestNewKubeJWTAuthenticator(t *testing.T) {
 			t.Errorf("Case %s: Unexpected Error: %v", id, err)
 		}
 		expectedAuthenticator := &KubeJWTAuthenticator{
-			client: tokenreview.NewK8sSvcAcctAuthn(url, caCertFileContent, string(jwtFileContent[:])),
+			client:      tokenreview.NewK8sSvcAcctAuthn(url, caCertFileContent, string(jwtFileContent)),
+			trustDomain: trustDomain,
 		}
 		if !reflect.DeepEqual(authenticator, expectedAuthenticator) {
 			t.Errorf("Case %q: Unexpected authentication result: want %v but got %v",
@@ -101,8 +103,8 @@ func TestNewKubeJWTAuthenticator(t *testing.T) {
 func TestAuthenticate(t *testing.T) {
 	testCases := map[string]struct {
 		metadata       metadata.MD
-		id             string
 		client         tokenReviewClient
+		expectedID     string
 		expectedErrMsg string
 	}{
 		"No bearer token": {
@@ -122,8 +124,19 @@ func TestAuthenticate(t *testing.T) {
 					"Bearer bearer-token",
 				},
 			},
-			client:         &mockTokenReviewClient{id: "", err: fmt.Errorf("test error")},
+			client:         &mockTokenReviewClient{id: nil, err: fmt.Errorf("test error")},
 			expectedErrMsg: "failed to validate the JWT: test error",
+		},
+		"Wrong identity length": {
+			metadata: metadata.MD{
+				"random": []string{},
+				"authorization": []string{
+					"Basic callername",
+					"Bearer bearer-token",
+				},
+			},
+			client:         &mockTokenReviewClient{id: []string{"foo"}, err: nil},
+			expectedErrMsg: "failed to parse the JWT. Validation result length is not 2, but 1",
 		},
 		"Successful": {
 			metadata: metadata.MD{
@@ -133,8 +146,8 @@ func TestAuthenticate(t *testing.T) {
 					"Bearer bearer-token",
 				},
 			},
-			id:             "namespace:serviceaccount",
-			client:         &mockTokenReviewClient{id: "namespace:serviceaccount", err: nil},
+			client:         &mockTokenReviewClient{id: []string{"foo", "bar"}, err: nil},
+			expectedID:     "spiffe://example.com/ns/foo/sa/bar",
 			expectedErrMsg: "",
 		},
 	}
@@ -145,7 +158,7 @@ func TestAuthenticate(t *testing.T) {
 			ctx = metadata.NewIncomingContext(ctx, tc.metadata)
 		}
 
-		authenticator := &KubeJWTAuthenticator{client: tc.client}
+		authenticator := &KubeJWTAuthenticator{client: tc.client, trustDomain: "example.com"}
 
 		actualCaller, err := authenticator.Authenticate(ctx)
 		if len(tc.expectedErrMsg) > 0 {
@@ -163,11 +176,54 @@ func TestAuthenticate(t *testing.T) {
 
 		expectedCaller := &Caller{
 			AuthSource: AuthSourceIDToken,
-			Identities: []string{tc.id},
+			Identities: []string{tc.expectedID},
 		}
 
 		if !reflect.DeepEqual(actualCaller, expectedCaller) {
 			t.Errorf("Case %q: Unexpected token: want %v but got %v", id, expectedCaller, actualCaller)
 		}
 	}
+}
+
+func TestAuthenticatorType(t *testing.T) {
+	testCases := []struct {
+		Name                      string
+		ExpectedAuthenticatorType string
+		ExpectedFailure           bool
+	}{
+		{
+			Name:                      "Correct type",
+			ExpectedAuthenticatorType: KubeJWTAuthenticatorType,
+			ExpectedFailure:           false,
+		},
+		{
+			Name:                      "Incorrect type",
+			ExpectedAuthenticatorType: ClientCertAuthenticatorType,
+			ExpectedFailure:           true,
+		},
+	}
+
+	caCertFileContent := []byte("CACERT")
+	jwtFileContent := []byte("JWT")
+	trustDomain := "testdomain.com"
+	url := "https://server/url"
+
+	kubeJwtAuthenticator := &KubeJWTAuthenticator{
+		client:      tokenreview.NewK8sSvcAcctAuthn(url, caCertFileContent, string(jwtFileContent)),
+		trustDomain: trustDomain,
+	}
+
+	for _, tc := range testCases {
+		want, got := tc.ExpectedAuthenticatorType, kubeJwtAuthenticator.AuthenticatorType()
+		if tc.ExpectedFailure {
+			if want == got {
+				t.Errorf("%s failed. Want: %s, got: %s", tc.Name, want, got)
+			}
+		} else {
+			if want != got {
+				t.Errorf("%s failed. Want: %s, got: %s", tc.Name, want, got)
+			}
+		}
+	}
+
 }

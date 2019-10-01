@@ -23,9 +23,12 @@ import (
 
 	"github.com/gogo/protobuf/types"
 
+	"istio.io/pkg/log"
+
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/log"
-	mcpclient "istio.io/istio/pkg/mcp/client"
+	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/mcp/sink"
 )
 
 var errUnsupported = errors.New("this operation is not supported by mcp controller")
@@ -34,12 +37,13 @@ var errUnsupported = errors.New("this operation is not supported by mcp controll
 // MCP Updater and ServiceDiscovery
 type CoreDataModel interface {
 	model.ConfigStoreCache
-	mcpclient.Updater
+	sink.Updater
 }
 
 // Options stores the configurable attributes of a Control
 type Options struct {
-	DomainSuffix string
+	DomainSuffix              string
+	ClearDiscoveryServerCache func(configType string)
 }
 
 // Controller is a temporary storage for the changes received
@@ -47,10 +51,10 @@ type Options struct {
 type Controller struct {
 	configStoreMu sync.RWMutex
 	// keys [type][namespace][name]
-	configStore              map[string]map[string]map[string]model.Config
-	descriptorsByMessageName map[string]model.ProtoSchema
-	options                  Options
-	eventHandlers            map[string][]func(model.Config, model.Event)
+	configStore             map[string]map[string]map[string]*model.Config
+	descriptorsByCollection map[string]schema.Instance
+	options                 Options
+	eventHandlers           map[string][]func(model.Config, model.Event)
 
 	syncedMu sync.Mutex
 	synced   map[string]bool
@@ -58,29 +62,29 @@ type Controller struct {
 
 // NewController provides a new CoreDataModel controller
 func NewController(options Options) CoreDataModel {
-	descriptorsByMessageName := make(map[string]model.ProtoSchema, len(model.IstioConfigTypes))
+	descriptorsByMessageName := make(map[string]schema.Instance, len(schemas.Istio))
 	synced := make(map[string]bool)
-	for _, descriptor := range model.IstioConfigTypes {
-		// don't register duplicate descriptors for the same message name, e.g. auth policy
-		if _, ok := descriptorsByMessageName[descriptor.MessageName]; !ok {
-			descriptorsByMessageName[descriptor.MessageName] = descriptor
-			synced[descriptor.MessageName] = false
+	for _, descriptor := range schemas.Istio {
+		// don't register duplicate descriptors for the same collection
+		if _, ok := descriptorsByMessageName[descriptor.Collection]; !ok {
+			descriptorsByMessageName[descriptor.Collection] = descriptor
+			synced[descriptor.Collection] = false
 		}
 	}
 
 	return &Controller{
-		configStore:              make(map[string]map[string]map[string]model.Config),
-		options:                  options,
-		descriptorsByMessageName: descriptorsByMessageName,
-		eventHandlers:            make(map[string][]func(model.Config, model.Event)),
-		synced:                   synced,
+		configStore:             make(map[string]map[string]map[string]*model.Config),
+		options:                 options,
+		descriptorsByCollection: descriptorsByMessageName,
+		eventHandlers:           make(map[string][]func(model.Config, model.Event)),
+		synced:                  synced,
 	}
 }
 
 // ConfigDescriptor returns all the ConfigDescriptors that this
 // controller is responsible for
-func (c *Controller) ConfigDescriptor() model.ConfigDescriptor {
-	return model.IstioConfigTypes
+func (c *Controller) ConfigDescriptor() schema.Set {
+	return schemas.Istio
 }
 
 // List returns all the config that is stored by type and namespace
@@ -102,38 +106,37 @@ func (c *Controller) List(typ, namespace string) (out []model.Config, err error)
 		// we replace the entire sub-map
 		for _, byNamespace := range byType {
 			for _, config := range byNamespace {
-				out = append(out, config)
+				out = append(out, *config)
 			}
 		}
 		return out, nil
 	}
 
 	for _, config := range byType[namespace] {
-		out = append(out, config)
+		out = append(out, *config)
 	}
 	return out, nil
 }
 
 // Apply receives changes from MCP server and creates the
 // corresponding config
-func (c *Controller) Apply(change *mcpclient.Change) error {
-	messagename := extractMessagename(change.TypeURL)
-	descriptor, ok := c.descriptorsByMessageName[messagename]
+func (c *Controller) Apply(change *sink.Change) error {
+	descriptor, ok := c.descriptorsByCollection[change.Collection]
 	if !ok {
-		return fmt.Errorf("apply type not supported %s", messagename)
+		return fmt.Errorf("apply type not supported %s", change.Collection)
 	}
 
-	schema, valid := c.ConfigDescriptor().GetByType(descriptor.Type)
+	s, valid := c.ConfigDescriptor().GetByType(descriptor.Type)
 	if !valid {
-		return fmt.Errorf("descriptor type not supported %s", messagename)
+		return fmt.Errorf("descriptor type not supported %s", descriptor.Type)
 	}
 
 	c.syncedMu.Lock()
-	c.synced[messagename] = true
+	c.synced[change.Collection] = true
 	c.syncedMu.Unlock()
 
 	// innerStore is [namespace][name]
-	innerStore := make(map[string]map[string]model.Config)
+	innerStore := make(map[string]map[string]*model.Config)
 	for _, obj := range change.Objects {
 		namespace, name := extractNameNamespace(obj.Metadata.Name)
 
@@ -141,103 +144,55 @@ func (c *Controller) Apply(change *mcpclient.Change) error {
 		if obj.Metadata.CreateTime != nil {
 			var err error
 			if createTime, err = types.TimestampFromProto(obj.Metadata.CreateTime); err != nil {
-				return fmt.Errorf("failed to parse %v create_time: %v", obj.Metadata.Name, err)
+				// Do not return an error, instead discard the resources so that Pilot can process the rest.
+				log.Warnf("Discarding incoming MCP resource: invalid resource timestamp (%s/%s): %v", namespace, name, err)
+				continue
 			}
 		}
 
-		// adjust the type name for mesh-scoped resources
-		typ := descriptor.Type
-		if namespace == "" && descriptor.Type == model.AuthenticationPolicy.Type {
-			typ = model.AuthenticationMeshPolicy.Type
-		}
-
-		conf := model.Config{
+		conf := &model.Config{
 			ConfigMeta: model.ConfigMeta{
-				Type:              typ,
+				Type:              descriptor.Type,
 				Group:             descriptor.Group,
 				Version:           descriptor.Version,
 				Name:              name,
 				Namespace:         namespace,
 				ResourceVersion:   obj.Metadata.Version,
 				CreationTimestamp: createTime,
+				Labels:            obj.Metadata.Labels,
+				Annotations:       obj.Metadata.Annotations,
 				Domain:            c.options.DomainSuffix,
 			},
-			Spec: obj.Resource,
+			Spec: obj.Body,
 		}
 
-		if err := schema.Validate(conf.Name, conf.Namespace, conf.Spec); err != nil {
-			return err
+		if err := s.Validate(conf.Name, conf.Namespace, conf.Spec); err != nil {
+			// Do not return an error, instead discard the resources so that Pilot can process the rest.
+			log.Warnf("Discarding incoming MCP resource: validation failed (%s/%s): %v", conf.Namespace, conf.Name, err)
+			continue
 		}
 
 		namedConfig, ok := innerStore[conf.Namespace]
 		if ok {
 			namedConfig[conf.Name] = conf
 		} else {
-			innerStore[conf.Namespace] = map[string]model.Config{
+			innerStore[conf.Namespace] = map[string]*model.Config{
 				conf.Name: conf,
 			}
 		}
 	}
 
-	// de-mux namespace and cluster-scoped authentication policy from the same
-	// type_url stream.
-	const clusterScopedNamespace = ""
-	meshTypeInnerStore := make(map[string]map[string]model.Config)
-	var meshType string
-	if descriptor.Type == model.AuthenticationPolicy.Type {
-		meshType = model.AuthenticationMeshPolicy.Type
-		meshTypeInnerStore[clusterScopedNamespace] = innerStore[clusterScopedNamespace]
-		delete(innerStore, clusterScopedNamespace)
-	}
-
-	var prevStore map[string]map[string]model.Config
+	var prevStore map[string]map[string]*model.Config
 
 	c.configStoreMu.Lock()
 	prevStore = c.configStore[descriptor.Type]
 	c.configStore[descriptor.Type] = innerStore
-	if meshType != "" {
-		c.configStore[meshType] = meshTypeInnerStore
-	}
 	c.configStoreMu.Unlock()
 
-	dispatch := func(model model.Config, event model.Event) {}
-	if handlers, ok := c.eventHandlers[descriptor.Type]; ok {
-		dispatch = func(model model.Config, event model.Event) {
-			log.Debugf("MCP event dispatch: key=%v event=%v", model.Key(), event.String())
-			for _, handler := range handlers {
-				handler(model, event)
-			}
-		}
-	}
-
-	// add/update
-	for namespace, byName := range innerStore {
-		for name, config := range byName {
-			if prevByNamespace, ok := prevStore[namespace]; ok {
-				if prevConfig, ok := prevByNamespace[name]; ok {
-					if config.ResourceVersion != prevConfig.ResourceVersion {
-						dispatch(config, model.EventUpdate)
-					}
-				} else {
-					dispatch(config, model.EventAdd)
-				}
-			} else {
-				dispatch(config, model.EventAdd)
-			}
-		}
-	}
-
-	// remove
-	for namespace, prevByName := range prevStore {
-		for name, prevConfig := range prevByName {
-			if byNamespace, ok := innerStore[namespace]; ok {
-				if _, ok := byNamespace[name]; !ok {
-					dispatch(prevConfig, model.EventDelete)
-				}
-			} else {
-				dispatch(prevConfig, model.EventDelete)
-			}
-		}
+	if descriptor.Type == schemas.ServiceEntry.Type {
+		c.serviceEntryEvents(innerStore, prevStore)
+	} else {
+		c.options.ClearDiscoveryServerCache(descriptor.Type)
 	}
 
 	return nil
@@ -262,14 +217,14 @@ func (c *Controller) HasSynced() bool {
 	return true
 }
 
+// RegisterEventHandler registers a handler using the type as a key
+func (c *Controller) RegisterEventHandler(typ string, handler func(model.Config, model.Event)) {
+	c.eventHandlers[typ] = append(c.eventHandlers[typ], handler)
+}
+
 // Run is not implemented
 func (c *Controller) Run(stop <-chan struct{}) {
 	log.Warnf("Run: %s", errUnsupported)
-}
-
-// RegisterEventHandler is not implemented
-func (c *Controller) RegisterEventHandler(typ string, handler func(model.Config, model.Event)) {
-	c.eventHandlers[typ] = append(c.eventHandlers[typ], handler)
 }
 
 // Get is not implemented
@@ -295,17 +250,48 @@ func (c *Controller) Delete(typ, name, namespace string) error {
 	return errUnsupported
 }
 
+func (c *Controller) serviceEntryEvents(currentStore, prevStore map[string]map[string]*model.Config) {
+	dispatch := func(model model.Config, event model.Event) {}
+	if handlers, ok := c.eventHandlers[schemas.ServiceEntry.Type]; ok {
+		dispatch = func(model model.Config, event model.Event) {
+			log.Debugf("MCP event dispatch: key=%v event=%v", model.Key(), event.String())
+			for _, handler := range handlers {
+				handler(model, event)
+			}
+		}
+	}
+
+	// add/update
+	for namespace, byName := range currentStore {
+		for name, config := range byName {
+			if prevByNamespace, ok := prevStore[namespace]; ok {
+				if prevConfig, ok := prevByNamespace[name]; ok {
+					if config.ResourceVersion != prevConfig.ResourceVersion {
+						dispatch(*config, model.EventUpdate)
+					}
+				} else {
+					dispatch(*config, model.EventAdd)
+				}
+			} else {
+				dispatch(*config, model.EventAdd)
+			}
+		}
+	}
+
+	// delete
+	for namespace, prevByName := range prevStore {
+		for name, prevConfig := range prevByName {
+			if _, ok := currentStore[namespace][name]; !ok {
+				dispatch(*prevConfig, model.EventDelete)
+			}
+		}
+	}
+}
+
 func extractNameNamespace(metadataName string) (string, string) {
 	segments := strings.Split(metadataName, "/")
 	if len(segments) == 2 {
 		return segments[0], segments[1]
 	}
 	return "", segments[0]
-}
-
-func extractMessagename(typeURL string) string {
-	if slash := strings.LastIndex(typeURL, "/"); slash >= 0 {
-		return typeURL[slash+1:]
-	}
-	return typeURL
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2018 Istio Authors
+# Copyright 2019 Istio Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,14 +25,4 @@ set -u
 # Print commands
 set -x
 
-# shellcheck source=prow/lib.sh
-source "${ROOT}/prow/lib.sh"
-setup_and_export_git_sha
-
-cd "${ROOT}"
-
-# Unit tests are run against a local apiserver and etcd.
-# Integration/e2e tests in the other scripts are run against GKE or real clusters.
-JUNIT_UNIT_TEST_XML="${ARTIFACTS_DIR}/junit_unit-tests.xml" \
-T="-v" \
-make test.integration.local
+"${ROOT}/prow/integ-suite-local.sh" test.integration.local

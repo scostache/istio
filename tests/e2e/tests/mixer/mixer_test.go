@@ -37,51 +37,39 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test/kube"
 	"istio.io/istio/tests/e2e/framework"
 	"istio.io/istio/tests/util"
+	"istio.io/pkg/log"
 )
 
 const (
-	bookinfoSampleDir     = "samples/bookinfo"
-	yamlExtension         = "yaml"
-	deploymentDir         = "platform/kube"
-	bookinfoYaml          = "bookinfo"
-	bookinfoRatingsv2Yaml = "bookinfo-ratings-v2"
-	bookinfoDbYaml        = "bookinfo-db"
-	sleepYaml             = "samples/sleep/sleep"
-	mixerTestDataDir      = "tests/e2e/tests/mixer/testdata"
+	bookinfoSampleDir      = "samples/bookinfo"
+	yamlExtension          = "yaml"
+	deploymentDir          = "platform/kube"
+	bookinfoYaml           = "bookinfo"
+	bookinfoRatingsv2Yaml  = "bookinfo-ratings-v2"
+	bookinfoDbYaml         = "bookinfo-db"
+	sleepYaml              = "samples/sleep/sleep"
+	mixerPromAdapterConfig = "mixer/test/prometheus/prometheus-nosession"
+	mixerMetricTemplate    = "mixer/template/metric/template"
+	oopPromDeployment      = "samples/bookinfo/policy/prometheus-adapter-deployment"
 
 	prometheusPort   = uint16(9090)
 	mixerMetricsPort = uint16(42422)
 	productPagePort  = uint16(10000)
 
-	srcLabel           = "source_service"
-	srcPodLabel        = "source_pod"
-	srcWorkloadLabel   = "source_workload"
-	srcOwnerLabel      = "source_owner"
-	srcUIDLabel        = "source_workload_uid"
-	destLabel          = "destination_service"
-	destPodLabel       = "destination_pod"
-	destWorkloadLabel  = "destination_workload"
-	destOwnerLabel     = "destination_owner"
-	destUIDLabel       = "destination_workload_uid"
-	destContainerLabel = "destination_container"
-	responseCodeLabel  = "response_code"
-	reporterLabel      = "reporter"
+	srcLabel          = "source_service"
+	srcWorkloadLabel  = "source_workload"
+	destLabel         = "destination_service"
+	responseCodeLabel = "response_code"
+	reporterLabel     = "reporter"
 
 	// This namespace is used by default in all mixer config documents.
 	// It will be replaced with the test namespace.
 	templateNamespace = "istio-system"
 
-	checkPath  = "/istio.mixer.v1.Mixer/Check"
-	reportPath = "/istio.mixer.v1.Mixer/Report"
-
 	testRetryTimes = 5
-
-	redisInstallDir  = "stable/redis"
-	redisInstallName = "redis-release"
 )
 
 type testConfig struct {
@@ -99,21 +87,21 @@ var (
 	ingressName        = "ingressgateway"
 	productPageTimeout = 60 * time.Second
 
-	networkingDir               = "networking"
-	policyDir                   = "policy"
-	rateLimitRule               = "mixer-rule-ratings-ratelimit"
-	denialRule                  = "mixer-rule-ratings-denial"
-	ingressDenialRule           = "mixer-rule-ingress-denial"
-	newTelemetryRule            = "mixer-rule-additional-telemetry"
-	kubeenvTelemetryRule        = "mixer-rule-kubernetesenv-telemetry"
-	destinationRuleAll          = "destination-rule-all"
-	routeAllRule                = "virtual-service-all-v1"
-	routeReviewsVersionsRule    = "virtual-service-reviews-v2-v3"
-	routeReviewsV3Rule          = "virtual-service-reviews-v3"
-	tcpDbRule                   = "virtual-service-ratings-db"
-	bookinfoGateway             = "bookinfo-gateway"
-	redisQuotaRollingWindowRule = "mixer-rule-ratings-redis-quota-rolling-window"
-	redisQuotaFixedWindowRule   = "mixer-rule-ratings-redis-quota-fixed-window"
+	networkingDir                = "networking"
+	policyDir                    = "policy"
+	rateLimitRule                = "mixer-rule-ratings-ratelimit"
+	denialRule                   = "mixer-rule-ratings-denial"
+	ingressDenialRule            = "mixer-rule-ingress-denial"
+	newTelemetryRule             = "../telemetry/metrics"
+	kubeenvTelemetryRule         = "mixer-rule-kubernetesenv-telemetry"
+	destinationRuleAll           = "destination-rule-all"
+	routeAllRule                 = "virtual-service-all-v1"
+	routeReviewsVersionsRule     = "virtual-service-reviews-v2-v3"
+	routeReviewsV3Rule           = "virtual-service-reviews-v3"
+	tcpDbRule                    = "virtual-service-ratings-db"
+	bookinfoGateway              = "bookinfo-gateway"
+	oopPromConfigs               = "prometheus-oop-rule"
+	faultInjectionNetworkingRule = "fault-injection-details-v1"
 
 	defaultRules []string
 	rules        []string
@@ -136,6 +124,8 @@ func (t *testConfig) Setup() (err error) {
 		*dr = filepath.Join(bookinfoSampleDir, networkingDir, *dr)
 		defaultRules = append(defaultRules, *dr)
 	}
+	// Append default metric template and prometheus adapter config for out of process adapter dynamic encoding
+	defaultRules = append(defaultRules, mixerPromAdapterConfig, mixerMetricTemplate)
 
 	rs := []*string{&rateLimitRule, &denialRule, &ingressDenialRule, &newTelemetryRule,
 		&kubeenvTelemetryRule}
@@ -144,15 +134,15 @@ func (t *testConfig) Setup() (err error) {
 		rules = append(rules, *r)
 	}
 
-	rs = []*string{&routeReviewsVersionsRule, &routeReviewsV3Rule, &tcpDbRule}
+	rs = []*string{&routeReviewsVersionsRule, &routeReviewsV3Rule, &tcpDbRule, &faultInjectionNetworkingRule}
 	for _, r := range rs {
 		*r = filepath.Join(bookinfoSampleDir, networkingDir, *r)
 		rules = append(rules, *r)
 	}
 
-	rs = []*string{&redisQuotaRollingWindowRule, &redisQuotaFixedWindowRule}
+	rs = []*string{&oopPromConfigs}
 	for _, r := range rs {
-		*r = filepath.Join(mixerTestDataDir, *r)
+		*r = filepath.Join(bookinfoSampleDir, policyDir, *r)
 		rules = append(rules, *r)
 	}
 
@@ -262,7 +252,7 @@ func applyRules(ruleKeys []string) error {
 	for _, ruleKey := range ruleKeys {
 		rule := getDestinationRulePath(tc, ruleKey)
 		if err := util.KubeApply(tc.Kube.Namespace, rule, tc.Kube.KubeConfig); err != nil {
-			//log.Errorf("Kubectl apply %s failed", rule)
+			log.Errorf("Kubectl apply %s failed", rule)
 			return err
 		}
 	}
@@ -305,7 +295,8 @@ func dumpK8Env() {
 	_, _ = util.Shell("kubectl --namespace %s get pods -o wide", tc.Kube.Namespace)
 
 	podLogs("istio="+ingressName, ingressName)
-	podLogs("istio=mixer", "mixer")
+	podLogs("istio=mixer,istio-mixer-type=policy", "mixer")
+	podLogs("istio=mixer,istio-mixer-type=telemetry", "mixer")
 	podLogs("istio=pilot", "discovery")
 	podLogs("app=productpage", "istio-proxy")
 
@@ -322,24 +313,6 @@ func podID(labelSelector string) (pod string, err error) {
 	return
 }
 
-func deployment(labelSelector string) (name, owner, uid string, err error) {
-	name, err = util.Shell("kubectl -n %s get deployment -l %s -o jsonpath='{.items[0].metadata.name}'", tc.Kube.Namespace, labelSelector)
-	if err != nil {
-		log.Warnf("could not get %s deployment: %v", labelSelector, err)
-		return
-	}
-	log.Infof("%s deployment name: %s", labelSelector, name)
-	uid = fmt.Sprintf("istio://%s/workloads/%s", tc.Kube.Namespace, name)
-	selfLink, err := util.Shell("kubectl -n %s get deployment -l %s -o jsonpath='{.items[0].metadata.selfLink}'", tc.Kube.Namespace, labelSelector)
-	if err != nil {
-		log.Warnf("could not get deployment %s self link: %v", name, err)
-		return
-	}
-	log.Infof("deployment %s self link: %s", labelSelector, selfLink)
-	owner = fmt.Sprintf("kubernetes:/%s", selfLink)
-	return
-}
-
 func podLogs(labelSelector string, container string) {
 	pod, err := podID(labelSelector)
 	if err != nil {
@@ -353,16 +326,16 @@ func podLogs(labelSelector string, container string) {
 // portForward sets up local port forward to the pod specified by the "app" label
 func (p *promProxy) portForward(labelSelector string, localPort, remotePort uint16) error {
 	log.Infof("Setting up %s proxy", labelSelector)
-	options := &kube.PodSelectOptions{
-		PodNamespace:  p.namespace,
-		LabelSelector: labelSelector,
-	}
 	accessor, err := kube.NewAccessor(tc.Kube.KubeConfig, "")
 	if err != nil {
 		log.Errorf("Error creating accessor: %v", err)
 		return err
 	}
-	forwarder, err := accessor.NewPortForwarder(options, localPort, remotePort)
+	pod, err := accessor.FindPodBySelectors(p.namespace, labelSelector)
+	if err != nil {
+		log.Errorf("error finding pods: %v", err)
+	}
+	forwarder, err := accessor.NewPortForwarder(pod, localPort, remotePort)
 	if err != nil {
 		log.Errorf("Error creating port forwarder: %v", err)
 		return err
@@ -417,29 +390,6 @@ func TestMain(m *testing.M) {
 	os.Exit(tc.RunTest(m))
 }
 
-type redisDeployment struct {
-}
-
-func (r *redisDeployment) Setup() error {
-	// Deploy Tiller if not already running.
-	if err := util.CheckPodRunning("kube-system", "name=tiller", tc.Kube.KubeConfig); err != nil {
-		if errDeployTiller := tc.Kube.DeployTiller(); errDeployTiller != nil {
-			return fmt.Errorf("failed to deploy helm tiller: %v", errDeployTiller)
-		}
-	}
-
-	setValue := "--set usePassword=false,persistence.enabled=false"
-	if err := util.HelmInstall(redisInstallDir, redisInstallName, "", tc.Kube.Namespace, setValue); err != nil {
-		return fmt.Errorf("helm install %s failed, setValue=%s", redisInstallDir, setValue)
-	}
-
-	return nil
-}
-
-func (r *redisDeployment) Teardown() error {
-	return util.HelmDelete(redisInstallName)
-}
-
 func setTestConfig() error {
 	cc, err := framework.NewCommonConfig("mixer_test")
 	if err != nil {
@@ -469,14 +419,16 @@ func setTestConfig() error {
 			AppYaml:    util.GetResourcePath(sleepYaml + "." + yamlExtension),
 			KubeInject: true,
 		},
+		{
+			AppYaml:    util.GetResourcePath(oopPromDeployment + "." + yamlExtension),
+			KubeInject: false,
+		},
 	}
 	for i := range demoApps {
 		tc.Kube.AppManager.AddApp(&demoApps[i])
 	}
 	mp := newPromProxy(tc.Kube.Namespace)
-	redis := &redisDeployment{}
 	tc.Cleanup.RegisterCleanable(mp)
-	tc.Cleanup.RegisterCleanable(redis)
 	return nil
 }
 
@@ -493,16 +445,31 @@ func errorf(t *testing.T, format string, args ...interface{}) {
 }
 
 func TestMetric(t *testing.T) {
-	checkMetricReport(t, destLabel, fqdn("productpage"))
+	checkMetricReport(t, "istio_requests_total", destLabel, fqdn("productpage"))
 }
 
 func TestIngressMetric(t *testing.T) {
-	checkMetricReport(t, srcWorkloadLabel, "istio-"+ingressName)
+	checkMetricReport(t, "istio_requests_total", srcWorkloadLabel, "istio-"+ingressName)
+}
+
+func TestOOPMetric(t *testing.T) {
+	if err := applyMixerRule(oopPromConfigs); err != nil {
+		fatalf(t, "could not apply required out of process configs: %v", err)
+	}
+
+	defer func() {
+		if err := deleteMixerRule(oopPromConfigs); err != nil {
+			t.Logf("could not clear out of process config: %v", err)
+		}
+	}()
+	allowRuleSync()
+
+	checkMetricReport(t, "istio_request_count_oop", destLabel, fqdn("productpage"))
 }
 
 // checkMetricReport checks whether report works for the given service
 // by visiting productpage and comparing request_count metric.
-func checkMetricReport(t *testing.T, label, labelValue string) {
+func checkMetricReport(t *testing.T, name, label, labelValue string) {
 	// setup prometheus API
 	promAPI, err := promAPI()
 	if err != nil {
@@ -513,7 +480,7 @@ func checkMetricReport(t *testing.T, label, labelValue string) {
 
 	// establish baseline by querying request count metric.
 	t.Log("establishing metrics baseline for test...")
-	query := fmt.Sprintf("istio_requests_total{%s=\"%s\"}", label, labelValue)
+	query := fmt.Sprintf("%s{%s=\"%s\"}", name, label, labelValue)
 	t.Logf("prometheus query: %s", query)
 	value, err := promAPI.Query(context.Background(), query, time.Now())
 	if err != nil {
@@ -537,7 +504,7 @@ func checkMetricReport(t *testing.T, label, labelValue string) {
 
 	t.Log("Successfully sent request(s) to /productpage; checking metrics...")
 
-	query = fmt.Sprintf("istio_requests_total{%s=\"%s\",%s=\"200\"}", label, labelValue, responseCodeLabel)
+	query = fmt.Sprintf("%s{%s=\"%s\",%s=\"200\"}", name, label, labelValue, responseCodeLabel)
 	t.Logf("prometheus query: %s", query)
 	value, err = promAPI.Query(context.Background(), query, time.Now())
 	if err != nil {
@@ -582,11 +549,11 @@ func TestTcpMetrics(t *testing.T) {
 	if err != nil {
 		fatalf(t, "Could not build prometheus API client: %v", err)
 	}
-	query := fmt.Sprintf("istio_tcp_sent_bytes_total{destination_app=\"%s\"}", "mongodb")
+	query := fmt.Sprintf("sum(istio_tcp_sent_bytes_total{destination_app=\"%s\"})", "mongodb")
 	want := float64(1)
 	validateMetric(t, promAPI, query, "istio_tcp_sent_bytes_total", want)
 
-	query = fmt.Sprintf("istio_tcp_received_bytes_total{destination_app=\"%s\"}", "mongodb")
+	query = fmt.Sprintf("sum(istio_tcp_received_bytes_total{destination_app=\"%s\"})", "mongodb")
 	validateMetric(t, promAPI, query, "istio_tcp_received_bytes_total", want)
 
 	query = fmt.Sprintf("sum(istio_tcp_connections_opened_total{destination_app=\"%s\"})", "mongodb")
@@ -600,16 +567,33 @@ func TestTcpMetrics(t *testing.T) {
 func validateMetric(t *testing.T, promAPI v1.API, query, metricName string, want float64) {
 	t.Helper()
 	t.Logf("prometheus query: %s", query)
-	value, err := promAPI.Query(context.Background(), query, time.Now())
-	if err != nil {
-		fatalf(t, "Could not get metrics from prometheus: %v", err)
+
+	var got float64
+
+	retry := util.Retrier{
+		BaseDelay: 30 * time.Second,
+		Retries:   4,
 	}
 
-	got, err := vectorValue(value, map[string]string{})
-	if err != nil {
+	retryFn := func(_ context.Context, i int) error {
+		t.Helper()
+		t.Logf("Trying to find metrics via promql (attempt %d)...", i)
+		value, err := promAPI.Query(context.Background(), query, time.Now())
+		if err != nil {
+			errorf(t, "Could not get metrics from prometheus: %v", err)
+			return err
+		}
+		got, err = vectorValue(value, map[string]string{})
+		t.Logf("vector value => got: %f, err: %v", got, err)
+		return err
+	}
+
+	if _, err := retry.Retry(context.Background(), retryFn); err != nil {
 		t.Logf("prometheus values for %s:\n%s", metricName, promDump(promAPI, metricName))
+		dumpMixerMetrics()
 		fatalf(t, "Could not find metric value: %v", err)
 	}
+
 	t.Logf("%s: %f", metricName, got)
 	if got < want {
 		t.Logf("prometheus values for %s:\n%s", metricName, promDump(promAPI, metricName))
@@ -631,36 +615,50 @@ func TestNewMetrics(t *testing.T) {
 	dumpK8Env()
 	allowRuleSync()
 
-	if err := visitProductPage(productPageTimeout, http.StatusOK); err != nil {
-		fatalf(t, "Test app setup failure: %v", err)
+	var got float64
+
+	retry := util.Retrier{
+		BaseDelay: 10 * time.Second,
+		MaxDelay:  30 * time.Second,
+		Retries:   4,
 	}
 
-	log.Info("Successfully sent request(s) to /productpage; checking metrics...")
-	allowPrometheusSync()
 	promAPI, err := promAPI()
 	if err != nil {
 		fatalf(t, "Could not build prometheus API client: %v", err)
 	}
-	query := fmt.Sprintf("istio_response_bytes_count{%s=\"%s\",%s=\"200\"}", destLabel, fqdn("productpage"), responseCodeLabel)
-	t.Logf("prometheus query: %s", query)
-	value, err := promAPI.Query(context.Background(), query, time.Now())
-	if err != nil {
-		fatalf(t, "Could not get metrics from prometheus: %v", err)
-	}
-	log.Infof("promvalue := %s", value.String())
 
-	got, err := vectorValue(value, map[string]string{})
-	if err != nil {
-		t.Logf("prometheus values for istio_response_bytes_count:\n%s", promDump(promAPI, "istio_response_bytes_count"))
-		t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
+	retryFn := func(ctx context.Context, i int) error {
+		if err := visitProductPage(productPageTimeout, http.StatusOK); err != nil {
+			return fmt.Errorf("test app setup failure: %v", err)
+		}
+
+		t.Logf("Successfully sent request(s) to /productpage; checking metrics...")
+		allowPrometheusSync()
+		query := fmt.Sprintf("sum(istio_double_request_count{%s=\"%s\"})", "destination", "productpage-v1")
+
+		got, err = queryValue(promAPI, query)
+		if err != nil {
+			t.Logf("prometheus values for istio_double_request_count:\n%s", promDump(promAPI, "istio_double_request_count"))
+			t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
+			return fmt.Errorf("could not extract value from received metric: %v", err)
+		}
+		return nil
+	}
+
+	if _, err := retry.Retry(context.Background(), retryFn); err != nil {
+		t.Logf("prometheus values for istio_double_request_count:\n%s", promDump(promAPI, "istio_double_request_count"))
+		dumpMixerMetrics()
 		fatalf(t, "Could not find metric value: %v", err)
 	}
-	want := float64(1)
+
+	want := float64(2)
 	if got < want {
-		t.Logf("prometheus values for istio_response_bytes_count:\n%s", promDump(promAPI, "istio_response_bytes_count"))
+		t.Logf("prometheus values for istio_double_request_count:\n%s", promDump(promAPI, "istio_double_request_count"))
 		t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
 		errorf(t, "Bad metric value: got %f, want at least %f", got, want)
 	}
+
 }
 
 func TestKubeenvMetrics(t *testing.T) {
@@ -686,27 +684,9 @@ func TestKubeenvMetrics(t *testing.T) {
 	if err != nil {
 		fatalf(t, "Could not build prometheus API client: %v", err)
 	}
-	productPagePod, err := podID("app=productpage")
-	if err != nil {
-		fatalf(t, "Could not get productpage pod ID: %v", err)
-	}
-	productPageWorkloadName, productPageOwner, productPageUID, err := deployment("app=productpage")
-	if err != nil {
-		fatalf(t, "Could not get productpage deployment metadata: %v", err)
-	}
-	ingressPod, err := podID(fmt.Sprintf("istio=%s", ingressName))
-	if err != nil {
-		fatalf(t, "Could not get ingress pod ID: %v", err)
-	}
-	ingressWorkloadName, ingressOwner, ingressUID, err := deployment(fmt.Sprintf("istio=%s", ingressName))
-	if err != nil {
-		fatalf(t, "Could not get ingress deployment metadata: %v", err)
-	}
 
-	query := fmt.Sprintf("istio_kube_request_count{%s=\"%s\",%s=\"%s\",%s=\"%s\",%s=\"%s\",%s=\"%s\",%s=\"%s\",%s=\"%s\",%s=\"%s\",%s=\"%s\",%s=\"200\"}",
-		srcPodLabel, ingressPod, srcWorkloadLabel, ingressWorkloadName, srcOwnerLabel, ingressOwner, srcUIDLabel, ingressUID,
-		destPodLabel, productPagePod, destWorkloadLabel, productPageWorkloadName, destOwnerLabel, productPageOwner, destUIDLabel, productPageUID,
-		destContainerLabel, "productpage", responseCodeLabel)
+	// instead of trying to find an exact match, we'll loop through all successful requests to ensure no values are "unknown"
+	query := fmt.Sprintf("istio_kube_request_count{%s=\"200\"}", responseCodeLabel)
 	t.Logf("prometheus query: %s", query)
 	value, err := promAPI.Query(context.Background(), query, time.Now())
 	if err != nil {
@@ -714,14 +694,24 @@ func TestKubeenvMetrics(t *testing.T) {
 	}
 	log.Infof("promvalue := %s", value.String())
 
-	got, err := vectorValue(value, map[string]string{})
-	if err != nil {
-		t.Logf("prometheus values for istio_kube_request_count:\n%s", promDump(promAPI, "istio_kube_request_count"))
-		fatalf(t, "Error get metric value: %v", err)
+	if value.Type() != model.ValVector {
+		errorf(t, "Value not a model.Vector; was %s", value.Type().String())
 	}
-	want := float64(1)
-	if got < want {
-		errorf(t, "Bad metric value: got %f, want at least %f", got, want)
+	vec := value.(model.Vector)
+
+	if got, want := len(vec), 1; got < want {
+		errorf(t, "Found %d istio_kube_request_count metrics, want at least %d", got, want)
+	}
+
+	for _, sample := range vec {
+		metric := sample.Metric
+		for labelKey, labelVal := range metric {
+			// destination_container is expected to be unknown when containerPort is removed
+			// TODO(bianpengyuan): restore the destination_container check
+			if labelVal == "unknown" && labelKey != "destination_container" {
+				errorf(t, "Unexpected 'unknown' value for label '%s' in sample '%s'", labelKey, sample)
+			}
+		}
 	}
 }
 
@@ -769,8 +759,6 @@ func testDenials(t *testing.T, rule string) {
 
 // TestIngressCheckCache tests that check cache works in Ingress.
 func TestIngressCheckCache(t *testing.T) {
-	//t.Skip("https://github.com/istio/istio/issues/6309")
-
 	// Apply denial rule to istio-ingress, so that only request with ["x-user"] could go through.
 	// This is to make the test focus on ingress check cache.
 	t.Logf("block request through ingress if x-user header is john")
@@ -852,47 +840,81 @@ func testCheckCache(t *testing.T, visit func() error, app string) {
 		fatalf(t, "%v", err)
 	}
 
-	allowPrometheusSync()
-	t.Log("Query promethus to get new cache hits number...")
-	// Get new check cache hit.
-	got, err := getCheckCacheHits(promAPI, app)
-	if err != nil {
-		fatalf(t, "Unable to retrieve valid cached hit number: %v", err)
+	retry := util.Retrier{
+		BaseDelay: 10 * time.Second,
+		MaxDelay:  30 * time.Second,
+		Retries:   4,
 	}
-	t.Logf("New cache hits: %v", got)
 
-	// At least 1 call should be cache hit.
-	want := float64(1)
-	if (got - prior) < want {
-		errorf(t, "Check cache hit: %v is less than expected: %v", got-prior, want)
+	retryFn := func(_ context.Context, i int) error {
+		t.Helper()
+		t.Logf("Trying to query new check cache hit (attempt %d)...", i)
+		got, err := getCheckCacheHits(promAPI, app)
+		if err != nil {
+			errorf(t, "unable to retrieve valid cached hit number: %v", err)
+			return err
+		}
+		t.Logf("New cache hits: %v", got)
+		if got == prior {
+			return fmt.Errorf("got new check cache hit %v, want at least %v", got, prior+1)
+		}
+		return nil
+	}
+
+	if _, err := retry.Retry(context.Background(), retryFn); err != nil {
+		errorf(t, "check cache hit does not increase: %v", err)
 	}
 }
 
 // nolint: unparam
-func fetchRequestCount(t *testing.T, promAPI v1.API, service string) (prior429s float64, prior200s float64, value model.Value) {
+func fetchRequestCount(t *testing.T, promAPI v1.API, service, additionalLabels string, totalReqExpected float64) (prior429s float64, prior200s float64) {
 	var err error
 	t.Log("Establishing metrics baseline for test...")
-	query := fmt.Sprintf("istio_requests_total{%s=\"%s\"}", destLabel, fqdn(service))
-	t.Logf("prometheus query: %s", query)
-	value, err = promAPI.Query(context.Background(), query, time.Now())
-	if err != nil {
+
+	retry := util.Retrier{
+		BaseDelay: 30 * time.Second,
+		Retries:   4,
+	}
+
+	retryFn := func(_ context.Context, i int) error {
+		t.Helper()
+		t.Logf("Trying to find metrics via promql (attempt %d)...", i)
+		query := fmt.Sprintf("sum(istio_requests_total{%s=\"%s\",%s=\"%s\",%s})", destLabel, fqdn(service), reporterLabel, "destination", additionalLabels)
+		t.Logf("prometheus query: %s", query)
+		totalReq, err := queryValue(promAPI, query)
+		if err != nil {
+			t.Logf("error getting total requests (msg: %v)", err)
+			return err
+		}
+		if totalReq < totalReqExpected {
+			return fmt.Errorf("total Requests: %f less than expected: %f", totalReq, totalReqExpected)
+		}
+		return nil
+	}
+
+	if _, err := retry.Retry(context.Background(), retryFn); err != nil {
+		dumpMixerMetrics()
 		fatalf(t, "Could not get metrics from prometheus: %v", err)
 	}
 
-	prior429s, err = vectorValue(value, map[string]string{responseCodeLabel: "429", reporterLabel: "destination"})
+	query := fmt.Sprintf("sum(istio_requests_total{%s=\"%s\",%s=\"%s\",%s=\"%s\",%s})", destLabel, fqdn(service),
+		reporterLabel, "destination", responseCodeLabel, "429", additionalLabels)
+	prior429s, err = queryValue(promAPI, query)
 	if err != nil {
 		t.Logf("error getting prior 429s, using 0 as value (msg: %v)", err)
 		prior429s = 0
 	}
 
-	prior200s, err = vectorValue(value, map[string]string{responseCodeLabel: "200", reporterLabel: "destination"})
+	query = fmt.Sprintf("sum(istio_requests_total{%s=\"%s\",%s=\"%s\",%s=\"%s\",%s})", destLabel, fqdn(service),
+		reporterLabel, "destination", responseCodeLabel, "200", additionalLabels)
+	prior200s, err = queryValue(promAPI, query)
 	if err != nil {
 		t.Logf("error getting prior 200s, using 0 as value (msg: %v)", err)
 		prior200s = 0
 	}
 	t.Logf("Baseline established: prior200s = %f, prior429s = %f", prior200s, prior429s)
 
-	return prior429s, prior200s, value
+	return prior429s, prior200s
 }
 
 func sendTraffic(t *testing.T, msg string, calls int64) *fhttp.HTTPRunnerResults {
@@ -918,6 +940,75 @@ func sendTraffic(t *testing.T, msg string, calls int64) *fhttp.HTTPRunnerResults
 		fatalf(t, "Generating traffic via fortio failed: %v", err)
 	}
 	return res
+}
+
+// This test validates that, for telemetry generated from FI, the destination workload information
+// is all unknown. This was added in response to an issue in which the mixer Report protocol implementation
+// was not properly accounting for attribute deletion in batches. The setup and execution mirror the repro
+// detailed in https://github.com/istio/istio/issues/11151.
+func TestFaultInjectionTelemetry(t *testing.T) {
+	if err := replaceRouteRule(faultInjectionNetworkingRule); err != nil {
+		fatalf(t, "failed to apply fault injection config: %v", err)
+	}
+	defer func() {
+		if err := replaceRouteRule(routeAllRule); err != nil {
+			t.Fatalf("Could not restore default routing config: %v", err)
+		}
+	}()
+
+	allowRuleSync()
+
+	// setup prometheus API
+	promAPI, err := promAPI()
+	if err != nil {
+		fatalf(t, "Could not build prometheus API client: %v", err)
+	}
+
+	sendTraffic(t, "Sending traffic...", 100)
+	allowPrometheusSync()
+
+	retry := util.Retrier{
+		BaseDelay: 30 * time.Second,
+		Retries:   4,
+	}
+
+	var vector model.Vector
+
+	retryFn := func(_ context.Context, i int) error {
+		t.Helper()
+		t.Logf("Trying to find metrics via promql (attempt %d)...", i)
+		fiReqsQuery := `sum(istio_requests_total{response_code="555", response_flags="FI"}) by (destination_workload, destination_app)`
+		t.Logf("prometheus query: %s", fiReqsQuery)
+		result, err := promAPI.Query(context.Background(), fiReqsQuery, time.Now())
+		if err != nil {
+			return fmt.Errorf("could not get results for query: %s: %v", fiReqsQuery, err)
+		}
+		if result.Type() != model.ValVector {
+			return fmt.Errorf("query result not a model.Vector; was %s", result.Type().String())
+		}
+		vector = result.(model.Vector)
+		return nil
+	}
+
+	if _, err := retry.Retry(context.Background(), retryFn); err != nil {
+		dumpMixerMetrics()
+		fatalf(t, "Could not get metrics from prometheus: %v", err)
+	}
+
+	if got, want := len(vector), 1; got != want {
+		t.Errorf("got %d different labels for destination_workload and destination_app, want %d", got, want)
+	}
+
+	got, err := vectorValue(vector, map[string]string{"destination_workload": "unknown", "destination_app": "unknown"})
+	if err != nil {
+		t.Errorf("could not get extract value from: %#v: %v", vector, err)
+	}
+
+	want := 50.0
+	if got < want {
+		t.Errorf("got %f total fault injected requests, want at least %f", got, want)
+	}
+
 }
 
 func TestMetricsAndRateLimitAndRulesAndBookinfo(t *testing.T) {
@@ -952,11 +1043,11 @@ func TestMetricsAndRateLimitAndRulesAndBookinfo(t *testing.T) {
 
 	// establish baseline
 
-	initPrior429s, _, _ := fetchRequestCount(t, promAPI, "ratings")
+	initPrior429s, initPrior200s := fetchRequestCount(t, promAPI, "ratings", "", 0)
 
 	_ = sendTraffic(t, "Warming traffic...", 150)
 	allowPrometheusSync()
-	prior429s, prior200s, _ := fetchRequestCount(t, promAPI, "ratings")
+	prior429s, prior200s := fetchRequestCount(t, promAPI, "ratings", "", initPrior429s+initPrior200s+150)
 	// check if at least one more prior429 was reported
 	if prior429s-initPrior429s < 1 {
 		fatalf(t, "no 429 is allotted time: prior429s:%v", prior429s)
@@ -969,6 +1060,9 @@ func TestMetricsAndRateLimitAndRulesAndBookinfo(t *testing.T) {
 	succReqs := float64(res.RetCodes[http.StatusOK])
 	badReqs := res.RetCodes[http.StatusBadRequest]
 	actualDuration := res.ActualDuration.Seconds() // can be a bit more than requested
+
+	// print baseline metrics on istio-policy handling
+	logPolicyMetrics(t, "memquota", "ratings")
 
 	log.Info("Successfully sent request(s) to /productpage; checking metrics...")
 	t.Logf("Fortio Summary: %d reqs (%f rps, %f 200s (%f rps), %d 400s - %+v)",
@@ -993,194 +1087,49 @@ func TestMetricsAndRateLimitAndRulesAndBookinfo(t *testing.T) {
 		fatalf(t, "Not enough traffic generated to exercise rate limit: ratings_reqs=%f, want200s=%f", callsToRatings, want200s)
 	}
 
-	_, _, value := fetchRequestCount(t, promAPI, "ratings")
-	log.Infof("promvalue := %s", value.String())
-
-	got, err := vectorValue(value, map[string]string{responseCodeLabel: "429", "destination_version": "v1"})
-	if err != nil {
+	got200s, got429s := fetchRequestCount(t, promAPI, "ratings", "destination_version=\"v1\"", prior429s+prior200s+300)
+	if got429s == 0 {
 		t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
 		errorf(t, "Could not find 429s: %v", err)
-		got = 0 // want to see 200 rate even if no 429s were recorded
 	}
 
 	// Lenient calculation TODO: tighten/simplify
-	want := math.Floor(want429s * .25)
+	want429s = math.Floor(want429s * .25)
 
-	got = got - prior429s
+	got429s -= prior429s
 
-	t.Logf("Actual 429s: %f (%f rps)", got, got/actualDuration)
+	t.Logf("Actual 429s: %f (%f rps)", got429s, got429s/actualDuration)
 
 	// check resource exhausted
-	if got < want {
+	if got429s < want429s {
 		t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
-		errorf(t, "Bad metric value for rate-limited requests (429s): got %f, want at least %f", got, want)
+		errorf(t, "Bad metric value for rate-limited requests (429s): got %f, want at least %f", got429s, want429s)
 	}
 
-	got, err = vectorValue(value, map[string]string{responseCodeLabel: "200", "destination_version": "v1"})
-	if err != nil {
+	if got200s == 0 {
 		t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
 		errorf(t, "Could not find successes value: %v", err)
-		got = 0
 	}
 
-	got = got - prior200s
+	got200s -= prior200s
 
-	t.Logf("Actual 200s: %f (%f rps), expecting ~1 rps", got, got/actualDuration)
+	t.Logf("Actual 200s: %f (%f rps), expecting ~1 rps", got200s, got200s/actualDuration)
 
 	// establish some baseline to protect against flakiness due to randomness in routing
 	// and to allow for leniency in actual ceiling of enforcement (if 10 is the limit, but we allow slightly
 	// less than 10, don't fail this test).
-	want = math.Floor(want200s * .25)
+	want := math.Floor(want200s * .25)
 
 	// check successes
-	if got < want {
+	if got200s < want {
 		t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
-		errorf(t, "Bad metric value for successful requests (200s): got %f, want at least %f", got, want)
+		errorf(t, "Bad metric value for successful requests (200s): got %f, want at least %f", got200s, want)
 	}
 	// TODO: until https://github.com/istio/istio/issues/3028 is fixed, use 25% - should be only 5% or so
 	want200s = math.Ceil(want200s * 1.5)
-	if got > want200s {
+	if got200s > want {
 		t.Logf("prometheus values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
-		errorf(t, "Bad metric value for successful requests (200s): got %f, want at most %f", got, want200s)
-	}
-}
-
-func testRedisQuota(t *testing.T, quotaRule string) {
-	if err := replaceRouteRule(routeReviewsV3Rule); err != nil {
-		fatalf(t, "Could not create replace reviews routing rule: %v", err)
-	}
-	defer func() {
-		if err := deleteRoutingConfig(routeReviewsV3Rule); err != nil {
-			t.Fatalf("Could not delete reviews routing rule: %v", err)
-		}
-	}()
-
-	// the rate limit rule applies a max rate limit of 1 rps to the ratings service.
-	if err := applyMixerRule(quotaRule); err != nil {
-		fatalf(t, "could not create required mixer rule: %v", err)
-	}
-	defer func() {
-		if err := deleteMixerRule(quotaRule); err != nil {
-			t.Logf("could not clear rule: %v", err)
-		}
-	}()
-
-	allowRuleSync()
-
-	// setup prometheus API
-	promAPI, err := promAPI()
-	if err != nil {
-		fatalf(t, "Could not build prometheus API client: %v", err)
-	}
-
-	// establish baseline
-	_ = sendTraffic(t, "Warming traffic...", 150)
-	allowPrometheusSync()
-	initPrior429s, _, _ := fetchRequestCount(t, promAPI, "ratings")
-
-	_ = sendTraffic(t, "Warming traffic...", 150)
-	allowPrometheusSync()
-	prior429s, prior200s, _ := fetchRequestCount(t, promAPI, "ratings")
-	// check if at least one more prior429 was reported
-	if prior429s-initPrior429s < 1 {
-		fatalf(t, "no 429 in allotted time: prior429s:%v", prior429s)
-	}
-
-	// print baseline metrics on istio-policy handling
-	logPolicyMetrics(t, "redisquota", "ratings")
-
-	res := sendTraffic(t, "Sending traffic...", 300)
-	allowPrometheusSync()
-
-	totalReqs := res.DurationHistogram.Count
-	succReqs := float64(res.RetCodes[http.StatusOK])
-	badReqs := res.RetCodes[http.StatusBadRequest]
-	actualDuration := res.ActualDuration.Seconds() // can be a bit more than requested
-
-	log.Info("Successfully sent request(s) to /productpage; checking metrics...")
-	t.Logf("Fortio Summary: %d reqs (%f rps, %f 200s (%f rps), %d 400s - %+v)",
-		totalReqs, res.ActualQPS, succReqs, succReqs/actualDuration, badReqs, res.RetCodes)
-
-	// consider only successful requests (as recorded at productpage service)
-	callsToRatings := succReqs
-
-	want200s := 50.0
-
-	// everything in excess of 200s should be 429s (ideally)
-	want429s := callsToRatings - want200s
-
-	t.Logf("Expected Totals: 200s: %f (%f rps), 429s: %f (%f rps)", want200s, want200s/actualDuration, want429s, want429s/actualDuration)
-
-	// print metrics on istio-policy handling
-	logPolicyMetrics(t, "redisquota", "ratings")
-
-	// if we received less traffic than the expected enforced limit to ratings
-	// then there is no way to determine if the rate limit was applied at all
-	// and for how much traffic. log all metrics and abort test.
-	if callsToRatings < want200s {
-		attributes := []string{fmt.Sprintf("%s=\"%s\"", destLabel, fqdn("ratings"))}
-		t.Logf("full set of prometheus metrics for ratings:\n%s", promDumpWithAttributes(promAPI, "istio_requests_total", attributes))
-		fatalf(t, "Not enough traffic generated to exercise rate limit: ratings_reqs=%f, want200s=%f", callsToRatings, want200s)
-	}
-
-	_, _, value := fetchRequestCount(t, promAPI, "ratings")
-	log.Infof("promvalue := %s", value.String())
-
-	got, err := vectorValue(value, map[string]string{responseCodeLabel: "429", reporterLabel: "destination"})
-	if err != nil {
-		attributes := []string{fmt.Sprintf("%s=\"%s\"", destLabel, fqdn("ratings")),
-			fmt.Sprintf("%s=\"%d\"", responseCodeLabel, 429), fmt.Sprintf("%s=\"%s\"", reporterLabel, "destination")}
-		t.Logf("prometheus values for istio_requests_total for 429's:\n%s", promDumpWithAttributes(promAPI, "istio_requests_total", attributes))
-		errorf(t, "Could not find 429s: %v", err)
-		got = 0 // want to see 200 rate even if no 429s were recorded
-	}
-
-	want := math.Floor(want429s * 0.70)
-
-	got = got - prior429s
-
-	t.Logf("Actual 429s: %f (%f rps)", got, got/actualDuration)
-
-	// check resource exhausted
-	if got < want {
-		attributes := []string{fmt.Sprintf("%s=\"%s\"", destLabel, fqdn("ratings")),
-			fmt.Sprintf("%s=\"%d\"", responseCodeLabel, 429), fmt.Sprintf("%s=\"%s\"", reporterLabel, "destination")}
-		t.Logf("prometheus values for istio_requests_total for 429's:\n%s", promDumpWithAttributes(promAPI, "istio_requests_total", attributes))
-		errorf(t, "Bad metric value for rate-limited requests (429s): got %f, want at least %f", got, want)
-	}
-
-	got, err = vectorValue(value, map[string]string{responseCodeLabel: "200", reporterLabel: "destination"})
-	if err != nil {
-		attributes := []string{fmt.Sprintf("%s=\"%s\"", destLabel, fqdn("ratings")),
-			fmt.Sprintf("%s=\"%d\"", responseCodeLabel, 200), fmt.Sprintf("%s=\"%s\"", reporterLabel, "destination")}
-		t.Logf("prometheus values for istio_requests_total for 200's:\n%s", promDumpWithAttributes(promAPI, "istio_requests_total", attributes))
-		errorf(t, "Could not find successes value: %v", err)
-		got = 0
-	}
-
-	got = got - prior200s
-
-	t.Logf("Actual 200s: %f (%f rps), expecting ~1.666rps", got, got/actualDuration)
-
-	// establish some baseline to protect against flakiness due to randomness in routing
-	// and to allow for leniency in actual ceiling of enforcement (if 10 is the limit, but we allow slightly
-	// less than 10, don't fail this test).
-	want = math.Floor(want200s * 0.70)
-
-	// check successes
-	if got < want {
-		attributes := []string{fmt.Sprintf("%s=\"%s\"", destLabel, fqdn("ratings")),
-			fmt.Sprintf("%s=\"%d\"", responseCodeLabel, 200), fmt.Sprintf("%s=\"%s\"", reporterLabel, "destination")}
-		t.Logf("prometheus values for istio_requests_total for 200's:\n%s", promDumpWithAttributes(promAPI, "istio_requests_total", attributes))
-		errorf(t, "Bad metric value for successful requests (200s): got %f, want at least %f", got, want)
-	}
-	// TODO: until https://github.com/istio/istio/issues/3028 is fixed, use 25% - should be only 5% or so
-	want200s = math.Ceil(want200s * 1.25)
-	if got > want200s {
-		attributes := []string{fmt.Sprintf("%s=\"%s\"", destLabel, fqdn("ratings")),
-			fmt.Sprintf("%s=\"%d\"", responseCodeLabel, 200), fmt.Sprintf("%s=\"%s\"", reporterLabel, "destination")}
-		t.Logf("prometheus values for istio_requests_total for 200's:\n%s", promDumpWithAttributes(promAPI, "istio_requests_total", attributes))
-		errorf(t, "Bad metric value for successful requests (200s): got %f, want at most %f", got, want200s)
+		errorf(t, "Bad metric value for successful requests (200s): got %f, want at most %f", got200s, want200s)
 	}
 }
 
@@ -1220,12 +1169,6 @@ func logPolicyMetrics(t *testing.T, adapter, app string) {
 	t.Logf("istio-policy stats (all requests): mixer checkcache hits: %f, adapter '%s' dispatches: %f", mixerCacheHits, adapter, dispatches)
 }
 
-// nolint: deadcode
-func mixerCheckCacheHits(promAPI v1.API) (float64, error) {
-	query := "sum(mixer_checkcache_cache_hits_total{job=\"istio-policy\"})"
-	return queryValue(promAPI, query)
-}
-
 func adapterDispatches(promAPI v1.API, adapter string) (float64, error) {
 	query := fmt.Sprintf("sum(mixer_runtime_dispatches_total{adapter=\"%s\"})", adapter)
 	return queryValue(promAPI, query)
@@ -1246,14 +1189,6 @@ func queryValue(promAPI v1.API, query string) (float64, error) {
 		return 0, fmt.Errorf("could not get extract value from: %#v: %v", value, err)
 	}
 	return returnVal, nil
-}
-
-func TestRedisQuotaRollingWindow(t *testing.T) {
-	testRedisQuota(t, redisQuotaRollingWindowRule)
-}
-
-func TestRedisQuotaFixedWindow(t *testing.T) {
-	testRedisQuota(t, redisQuotaFixedWindowRule)
 }
 
 func TestMixerReportingToMixer(t *testing.T) {
@@ -1304,20 +1239,6 @@ func TestMixerReportingToMixer(t *testing.T) {
 		t.Logf("Values for istio_requests_total:\n%s", promDump(promAPI, "istio_requests_total"))
 		t.Errorf("Expected at least one metric with 'istio-telemetry' as the destination, got %d", len(vec))
 	}
-
-	t.Logf("Validating Mixer access logs show Check() and Report() calls...")
-	logs, err :=
-		util.Shell(`kubectl -n %s logs -l istio-mixer-type=telemetry -c mixer --tail 1000 | grep -e "%s" -e "%s"`,
-			tc.Kube.Namespace, checkPath, reportPath)
-	if err != nil {
-		t.Fatalf("Error retrieving istio-telemetry logs: %v", err)
-	}
-	wantLines := 4
-	gotLines := strings.Count(logs, "\n")
-	if gotLines < wantLines {
-		t.Errorf("Expected at least %v lines of Mixer-specific access logs, got %d", wantLines, gotLines)
-	}
-
 }
 
 func allowRuleSync() {
@@ -1345,20 +1266,6 @@ func promDump(client v1.API, metric string) string {
 		return value.String()
 	}
 	return ""
-}
-
-// promDumpWithAttributes is used to get all of the recorded values of a metric for particular attributes.
-// Attributes have to be of format %s=\"%s\"
-// nolint: unparam
-func promDumpWithAttributes(promAPI v1.API, metric string, attributes []string) string {
-	var err error
-	query := fmt.Sprintf("%s{%s}", metric, strings.Join(attributes, ", "))
-	value, err := promAPI.Query(context.Background(), query, time.Now())
-	if err != nil {
-		return ""
-	}
-
-	return value.String()
 }
 
 func vectorValue(val model.Value, labels map[string]string) (float64, error) {
@@ -1577,6 +1484,7 @@ func doMixerRule(ruleName string, do kubeDo) error {
 		return fmt.Errorf("%s must contain %s so the it can replaced", rule, templateNamespace)
 	}
 	contents = strings.Replace(contents, templateNamespace, tc.Kube.Namespace, -1)
+	contents = strings.Replace(contents, "namespace: default", "namespace: "+tc.Kube.Namespace, -1)
 	return do(tc.Kube.Namespace, contents, tc.Kube.KubeConfig)
 }
 

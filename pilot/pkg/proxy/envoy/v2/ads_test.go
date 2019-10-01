@@ -19,9 +19,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/proto"
+
 	"istio.io/istio/pilot/pkg/model"
 	v2 "istio.io/istio/pilot/pkg/proxy/envoy/v2"
 	"istio.io/istio/pkg/test/env"
+	"istio.io/istio/pkg/util/gogoprotomarshal"
 	"istio.io/istio/tests/util"
 
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
@@ -29,7 +32,7 @@ import (
 
 const (
 	routeA = "http.80"
-	routeB = "https.443.https"
+	routeB = "https.443.https.my-gateway.testns"
 )
 
 // Regression for envoy restart and overlapping connections
@@ -44,7 +47,10 @@ func TestAdsReconnectWithNonce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, _ := adsReceive(edsstr, 5*time.Second)
+	res, err := adsReceive(edsstr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// closes old process
 	cancel()
@@ -55,7 +61,7 @@ func TestAdsReconnectWithNonce(t *testing.T) {
 	}
 	defer cancel()
 
-	err = sendEDSReqReconnect([]string{"service3.default.svc.cluster.local|http"}, edsstr, res)
+	err = sendEDSReqReconnect([]string{"outbound|1080||service3.default.svc.cluster.local"}, edsstr, res)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +197,8 @@ func TestAdsUpdate(t *testing.T) {
 		Address:  "10.11.0.1",
 		Ports:    testPorts(0),
 	})
+	server.EnvoyXdsServer.ClearCache()
+	time.Sleep(time.Millisecond * 200)
 	_ = server.EnvoyXdsServer.MemRegistry.AddEndpoint("adsupdate.default.svc.cluster.local",
 		"http-main", 2080, "10.2.0.1", 1080)
 
@@ -224,10 +232,10 @@ func TestAdsUpdate(t *testing.T) {
 	if len(lbe) == 0 {
 		t.Fatal("No lb endpoints")
 	}
-	if "10.2.0.1" != lbe[0].Endpoint.Address.GetSocketAddress().Address {
-		t.Error("Expecting 10.2.0.1 got ", lbe[0].Endpoint.Address.GetSocketAddress().Address)
+	if lbe[0].GetEndpoint().Address.GetSocketAddress().Address != "10.2.0.1" {
+		t.Error("Expecting 10.2.0.1 got ", lbe[0].GetEndpoint().Address.GetSocketAddress().Address)
 	}
-	strResponse, _ := model.ToJSONWithIndent(res1, " ")
+	strResponse, _ := gogoprotomarshal.ToJSONWithIndent(res1, " ")
 	_ = ioutil.WriteFile(env.IstioOut+"/edsv2_sidecar.json", []byte(strResponse), 0644)
 
 	_ = server.EnvoyXdsServer.MemRegistry.AddEndpoint("adsupdate.default.svc.cluster.local",
@@ -241,7 +249,7 @@ func TestAdsUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal("Recv2 failed", err)
 	}
-	strResponse, _ = model.ToJSONWithIndent(res1, " ")
+	strResponse, _ = gogoprotomarshal.ToJSONWithIndent(res1, " ")
 	_ = ioutil.WriteFile(env.IstioOut+"/edsv2_update.json", []byte(strResponse), 0644)
 }
 
@@ -326,7 +334,10 @@ func TestEnvoyRDSUpdatedRouteRequest(t *testing.T) {
 		t.Fatal("No routes returned")
 	}
 	route1, err := unmarshallRoute(res.Resources[0].Value)
-	if err != nil || len(res.Resources) != 1 || route1.Name != routeA {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Resources) != 1 || route1.Name != routeA {
 		t.Fatal("Expected only the http.80 route to be returned")
 	}
 
@@ -419,7 +430,8 @@ func TestEnvoyRDSUpdatedRouteRequest(t *testing.T) {
 
 func unmarshallRoute(value []byte) (*xdsapi.RouteConfiguration, error) {
 	route := &xdsapi.RouteConfiguration{}
-	err := route.Unmarshal(value)
+
+	err := proto.Unmarshal(value, route)
 	if err != nil {
 		return nil, err
 	}

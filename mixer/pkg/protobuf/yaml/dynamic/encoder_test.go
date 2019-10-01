@@ -27,11 +27,11 @@ import (
 	diff "gopkg.in/d4l3k/messagediff.v1"
 
 	"istio.io/api/policy/v1beta1"
-	"istio.io/istio/mixer/pkg/attribute"
-	"istio.io/istio/mixer/pkg/lang/ast"
 	"istio.io/istio/mixer/pkg/lang/compiled"
 	protoyaml "istio.io/istio/mixer/pkg/protobuf/yaml"
 	foo "istio.io/istio/mixer/pkg/protobuf/yaml/testdata/all"
+	"istio.io/istio/mixer/pkg/runtime/lang"
+	"istio.io/pkg/attribute"
 )
 
 func TestEncodeVarintZeroExtend(t *testing.T) {
@@ -610,7 +610,7 @@ type testdata struct {
 	input       string
 	output      string
 	msg         string
-	compiler    Compiler
+	compiler    lang.Compiler
 	skipUnknown bool
 }
 
@@ -769,7 +769,7 @@ func TestStaticEncoder(t *testing.T) {
 }
 
 func testMsg(t *testing.T, input string, output string, res protoyaml.Resolver,
-	compiler Compiler, msgName string, skipUnknown bool) {
+	compiler lang.Compiler, msgName string, skipUnknown bool) {
 	data := map[string]interface{}{}
 	var err error
 	var ba []byte
@@ -885,7 +885,7 @@ func Test_transFormQuotedString(t *testing.T) {
 }
 
 // StandardVocabulary returns Istio standard vocabulary
-func StandardVocabulary() ast.AttributeDescriptorFinder {
+func StandardVocabulary() attribute.AttributeDescriptorFinder {
 	attrs := map[string]*v1beta1.AttributeManifest_AttributeInfo{
 		"api.operation":                   {ValueType: v1beta1.STRING},
 		"api.protocol":                    {ValueType: v1beta1.STRING},
@@ -949,7 +949,7 @@ func StandardVocabulary() ast.AttributeDescriptorFinder {
 		"test.email_address":              {ValueType: v1beta1.EMAIL_ADDRESS},
 	}
 
-	return ast.NewFinder(attrs)
+	return attribute.NewFinder(attrs)
 }
 
 func Test_Int64(t *testing.T) {

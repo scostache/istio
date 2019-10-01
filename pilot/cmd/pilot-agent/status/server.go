@@ -16,65 +16,117 @@ package status
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"istio.io/istio/pilot/pkg/model"
+
 	"istio.io/istio/pilot/cmd/pilot-agent/status/ready"
-	"istio.io/istio/pkg/log"
+	"istio.io/pkg/log"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
 	// readyPath is for the pilot agent readiness itself.
 	readyPath = "/healthz/ready"
-	// IstioAppPortHeader is the header name to indicate the app port for health check.
-	IstioAppPortHeader = "istio-app-probe-port"
+	// quitPath is to notify the pilot agent to quit.
+	quitPath = "/quitquitquit"
+	// KubeAppProberEnvName is the name of the command line flag for pilot agent to pass app prober config.
+	// The json encoded string to pass app HTTP probe information from injector(istioctl or webhook).
+	// For example, ISTIO_KUBE_APP_PROBERS='{"/app-health/httpbin/livez":{"path": "/hello", "port": 8080}.
+	// indicates that httpbin container liveness prober port is 8080 and probing path is /hello.
+	// This environment variable should never be set manually.
+	KubeAppProberEnvName = "ISTIO_KUBE_APP_PROBERS"
 )
 
-// AppProbeInfo defines the information for Pilot agent to take over application probing.
-type AppProbeInfo struct {
-	Path string
-	Port uint16
-}
+var (
+	appProberPattern = regexp.MustCompile(`^/app-health/[^/]+/(livez|readyz)$`)
+)
+
+// KubeAppProbers holds the information about a Kubernetes pod prober.
+// It's a map from the prober URL path to the Kubernetes Prober config.
+// For example, "/app-health/hello-world/livez" entry contains livenss prober config for
+// container "hello-world".
+type KubeAppProbers map[string]*corev1.HTTPGetAction
 
 // Config for the status server.
 type Config struct {
-	StatusPort       uint16
-	AdminPort        uint16
 	ApplicationPorts []uint16
+	LocalHostAddr    string
+	// KubeAppHTTPProbers is a json with Kubernetes application HTTP prober config encoded.
+	KubeAppHTTPProbers string
+	NodeType           model.NodeType
+	StatusPort         uint16
+	AdminPort          uint16
 }
 
 // Server provides an endpoint for handling status probes.
 type Server struct {
-	statusPort          uint16
 	ready               *ready.Probe
 	mutex               sync.RWMutex
+	appKubeProbers      KubeAppProbers
+	statusPort          uint16
 	lastProbeSuccessful bool
 }
 
 // NewServer creates a new status server.
-func NewServer(config Config) *Server {
-	return &Server{
+func NewServer(config Config) (*Server, error) {
+	s := &Server{
 		statusPort: config.StatusPort,
 		ready: &ready.Probe{
+			LocalHostAddr:    config.LocalHostAddr,
 			AdminPort:        config.AdminPort,
 			ApplicationPorts: config.ApplicationPorts,
+			NodeType:         config.NodeType,
 		},
 	}
+	if config.KubeAppHTTPProbers == "" {
+		return s, nil
+	}
+	if err := json.Unmarshal([]byte(config.KubeAppHTTPProbers), &s.appKubeProbers); err != nil {
+		return nil, fmt.Errorf("failed to decode app http prober err = %v, json string = %v", err, config.KubeAppHTTPProbers)
+	}
+	// Validate the map key matching the regex pattern.
+	for path, prober := range s.appKubeProbers {
+		if !appProberPattern.Match([]byte(path)) {
+			return nil, fmt.Errorf(`invalid key, must be in form of regex pattern ^/app-health/[^\/]+/(livez|readyz)$`)
+		}
+		if prober.Port.Type != intstr.Int {
+			return nil, fmt.Errorf("invalid prober config for %v, the port must be int type", path)
+		}
+	}
+	return s, nil
+}
+
+// FormatProberURL returns a pair of HTTP URLs that pilot agent will serve to take over Kubernetes
+// app probers.
+func FormatProberURL(container string) (string, string) {
+	return fmt.Sprintf("/app-health/%v/readyz", container),
+		fmt.Sprintf("/app-health/%v/livez", container)
 }
 
 // Run opens a the status port and begins accepting probes.
 func (s *Server) Run(ctx context.Context) {
 	log.Infof("Opening status port %d\n", s.statusPort)
 
+	mux := http.NewServeMux()
+
 	// Add the handler for ready probes.
-	http.HandleFunc(readyPath, s.handleReadyProbe)
-	http.HandleFunc("/", s.handleAppProbe)
+	mux.HandleFunc(readyPath, s.handleReadyProbe)
+	mux.HandleFunc(quitPath, s.handleQuit)
+	mux.HandleFunc("/app-health/", s.handleAppProbe)
 
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", s.statusPort))
 	if err != nil {
@@ -92,14 +144,17 @@ func (s *Server) Run(ctx context.Context) {
 	defer l.Close()
 
 	go func() {
-		if err := http.Serve(l, nil); err != nil {
+		if err := http.Serve(l, mux); err != nil {
 			log.Errora(err)
-			os.Exit(-1)
+			// If the server errors then pilot-agent can never pass readiness or liveness probes
+			// Therefore, trigger graceful termination by sending SIGTERM to the binary pid
+			notifyExit()
 		}
 	}()
 
 	// Wait for the agent to be shut down.
 	<-ctx.Done()
+	log.Info("Status server has successfully terminated")
 }
 
 func (s *Server) handleReadyProbe(w http.ResponseWriter, _ *http.Request) {
@@ -122,34 +177,79 @@ func (s *Server) handleReadyProbe(w http.ResponseWriter, _ *http.Request) {
 	s.mutex.Unlock()
 }
 
-func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
-	appPort := req.Header.Get(IstioAppPortHeader)
-	if _, err := strconv.Atoi(appPort); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+func isRequestFromLocalhost(r *http.Request) bool {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+
+	userIP := net.ParseIP(ip)
+	return userIP.IsLoopback()
+}
+
+func (s *Server) handleQuit(w http.ResponseWriter, r *http.Request) {
+	if !isRequestFromLocalhost(r) {
+		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
 		return
 	}
+	if r.Method != "POST" {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK"))
+	log.Infof("handling %s, notifying pilot-agent to exit", quitPath)
+	notifyExit()
+}
+
+func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
+	// Validate the request first.
+	path := req.URL.Path
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + req.URL.Path
+	}
+	prober, exists := s.appKubeProbers[path]
+	if !exists {
+		log.Errorf("Prober does not exists url %v", path)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(fmt.Sprintf("app prober config does not exists for %v", path)))
+		return
+	}
+
+	// Construct a request sent to the application.
 	httpClient := &http.Client{
 		// TODO: figure out the appropriate timeout?
 		Timeout: 10 * time.Second,
+		// We skip the verification since kubelet skips the verification for HTTPS prober as well
+		// https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-probes/#configure-probes
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
 	}
-	path := req.URL.Path
-	if !strings.HasPrefix(req.URL.Path, "/") {
-		path = "/" + req.URL.Path
+	var url string
+	if prober.Scheme == corev1.URISchemeHTTPS {
+		url = fmt.Sprintf("https://localhost:%v%s", prober.Port.IntValue(), prober.Path)
+	} else {
+		url = fmt.Sprintf("http://localhost:%v%s", prober.Port.IntValue(), prober.Path)
 	}
-	url := fmt.Sprintf("http://127.0.0.1:%s%s", appPort, path)
-	appReq, err := http.NewRequest(req.Method, url, req.Body)
-	for key, value := range req.Header {
-		appReq.Header[key] = value
-	}
-
+	appReq, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		log.Errorf("Failed to copy request to probe app %v, url %v", err, path)
+		log.Errorf("Failed to create request to probe app %v, original url %v", err, path)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	// Forward incoming headers to the application.
+	for name, values := range req.Header {
+		newValues := make([]string, len(values))
+		copy(newValues, values)
+		appReq.Header[name] = newValues
+	}
+
+	// Send the request.
 	response, err := httpClient.Do(appReq)
 	if err != nil {
-		log.Errorf("Request to probe app failed: %v, url %v", err, path)
+		log.Errorf("Request to probe app failed: %v, original URL path = %v\napp URL path = %v", err, path, prober.Path)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -157,4 +257,15 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 
 	// We only write the status code to the response.
 	w.WriteHeader(response.StatusCode)
+}
+
+// notifyExit sends SIGTERM to itself
+func notifyExit() {
+	p, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		log.Errora(err)
+	}
+	if err := p.Signal(syscall.SIGTERM); err != nil {
+		log.Errorf("failed to send SIGTERM to self: %v", err)
+	}
 }

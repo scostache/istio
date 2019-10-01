@@ -20,30 +20,34 @@ import (
 	"strings"
 
 	"github.com/gogo/protobuf/proto"
-	ingress "k8s.io/api/extensions/v1beta1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 
 	mcp "istio.io/api/mcp/v1alpha1"
 	"istio.io/api/networking/v1alpha3"
+	"istio.io/pkg/log"
+
 	"istio.io/istio/galley/pkg/metadata"
 	"istio.io/istio/galley/pkg/runtime/resource"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/config/protocol"
+
+	ingress "k8s.io/api/extensions/v1beta1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 var scope = log.RegisterScope("conversions", "proto converters for runtime state", 0)
 
-// ToIngressSpec unwraps an enveloped proto
-func ToIngressSpec(e *mcp.Envelope) (*ingress.IngressSpec, error) {
+// ToIngressSpec unwraps an MCP resource proto
+func ToIngressSpec(e *mcp.Resource) (*ingress.IngressSpec, error) {
 
-	p := metadata.IngressSpec.NewProtoInstance()
+	p := metadata.K8sExtensionsV1beta1Ingresses.NewProtoInstance()
 	i, ok := p.(*ingress.IngressSpec)
 	if !ok {
 		// Shouldn't happen
 		return nil, fmt.Errorf("unable to convert proto to Ingress: %v", p)
 	}
 
-	if err := proto.Unmarshal(e.Resource.Value, p); err != nil {
+	if err := proto.Unmarshal(e.Body.Value, p); err != nil {
 		// Shouldn't happen
 		return nil, fmt.Errorf("unable to unmarshal Ingress during projection: %v", err)
 	}
@@ -52,7 +56,8 @@ func ToIngressSpec(e *mcp.Envelope) (*ingress.IngressSpec, error) {
 }
 
 // IngressToVirtualService converts from ingress spec to Istio VirtualServices
-func IngressToVirtualService(key resource.VersionedKey, i *ingress.IngressSpec, domainSuffix string, ingressByHost map[string]resource.Entry) {
+func IngressToVirtualService(key resource.VersionedKey, meta resource.Metadata, i *ingress.IngressSpec,
+	domainSuffix string, ingressByHost map[string]resource.Entry) {
 	// Ingress allows a single host - if missing '*' is assumed
 	// We need to merge all rules with a particular host across
 	// all ingresses, and return a separate VirtualService for each
@@ -72,16 +77,16 @@ func IngressToVirtualService(key resource.VersionedKey, i *ingress.IngressSpec, 
 		}
 		virtualService := &v1alpha3.VirtualService{
 			Hosts:    []string{host},
-			Gateways: []string{model.IstioIngressGatewayName},
+			Gateways: []string{constants.IstioIngressGatewayName},
 		}
 
-		httpRoutes := []*v1alpha3.HTTPRoute{}
-		for _, path := range rule.HTTP.Paths {
+		httpRoutes := make([]*v1alpha3.HTTPRoute, 0)
+		for _, httpPath := range rule.HTTP.Paths {
 			httpMatch := &v1alpha3.HTTPMatchRequest{
-				Uri: createStringMatch(path.Path),
+				Uri: createStringMatch(httpPath.Path),
 			}
 
-			httpRoute := ingressBackendToHTTPRoute(&path.Backend, namespace, domainSuffix)
+			httpRoute := ingressBackendToHTTPRoute(&httpPath.Backend, namespace, domainSuffix)
 			if httpRoute == nil {
 				scope.Infof("invalid ingress rule %s:%s for host %q, no backend defined for path", namespace, name, rule.Host)
 				continue
@@ -92,8 +97,8 @@ func IngressToVirtualService(key resource.VersionedKey, i *ingress.IngressSpec, 
 
 		virtualService.Http = httpRoutes
 
-		newName := namePrefix + "-" + name + "-" + model.IstioIngressGatewayName
-		newNamespace := model.IstioIngressNamespace
+		newName := namePrefix + "-" + name + "-" + constants.IstioIngressGatewayName
+		newNamespace := constants.IstioIngressNamespace
 
 		old, f := ingressByHost[host]
 		if f {
@@ -103,13 +108,13 @@ func IngressToVirtualService(key resource.VersionedKey, i *ingress.IngressSpec, 
 			ingressByHost[host] = resource.Entry{
 				ID: resource.VersionedKey{
 					Key: resource.Key{
-						FullName: resource.FullNameFromNamespaceAndName(newNamespace, newName),
-						TypeURL:  metadata.VirtualService.TypeURL,
+						FullName:   resource.FullNameFromNamespaceAndName(newNamespace, newName),
+						Collection: metadata.IstioNetworkingV1alpha3Virtualservices.Collection,
 					},
-					Version:    key.Version,
-					CreateTime: key.CreateTime,
+					Version: key.Version,
 				},
-				Item: virtualService,
+				Metadata: meta,
+				Item:     virtualService,
 			}
 		}
 	}
@@ -179,11 +184,11 @@ func ingressBackendToHTTPRoute(backend *ingress.IngressBackend, namespace string
 }
 
 // IngressToGateway converts from ingress spec to Istio Gateway
-func IngressToGateway(key resource.VersionedKey, i *ingress.IngressSpec) resource.Entry {
+func IngressToGateway(key resource.VersionedKey, meta resource.Metadata, i *ingress.IngressSpec) resource.Entry {
 	namespace, name := key.FullName.InterpretAsNamespaceAndName()
 
 	gateway := &v1alpha3.Gateway{
-		Selector: model.IstioIngressWorkloadLabels,
+		Selector: labels.Instance{constants.IstioLabel: constants.IstioIngressLabelValue},
 	}
 
 	// FIXME this is a temporary hack until all test templates are updated
@@ -197,7 +202,7 @@ func IngressToGateway(key resource.VersionedKey, i *ingress.IngressSpec) resourc
 		gateway.Servers = append(gateway.Servers, &v1alpha3.Server{
 			Port: &v1alpha3.Port{
 				Number:   443,
-				Protocol: string(model.ProtocolHTTPS),
+				Protocol: string(protocol.HTTPS),
 				Name:     fmt.Sprintf("https-443-i-%s-%s", name, namespace),
 			},
 			Hosts: tls.Hosts,
@@ -207,10 +212,10 @@ func IngressToGateway(key resource.VersionedKey, i *ingress.IngressSpec) resourc
 				HttpsRedirect: false,
 				Mode:          v1alpha3.Server_TLSOptions_SIMPLE,
 				// TODO this is no longer valid for the new v2 stuff
-				PrivateKey:        path.Join(model.IngressCertsPath, model.IngressKeyFilename),
-				ServerCertificate: path.Join(model.IngressCertsPath, model.IngressCertFilename),
+				PrivateKey:        path.Join(constants.IngressCertsPath, constants.IngressKeyFilename),
+				ServerCertificate: path.Join(constants.IngressCertsPath, constants.IngressCertFilename),
 				// TODO: make sure this is mounted
-				CaCertificates: path.Join(model.IngressCertsPath, model.RootCertFilename),
+				CaCertificates: path.Join(constants.IngressCertsPath, constants.RootCertFilename),
 			},
 		})
 	}
@@ -218,25 +223,25 @@ func IngressToGateway(key resource.VersionedKey, i *ingress.IngressSpec) resourc
 	gateway.Servers = append(gateway.Servers, &v1alpha3.Server{
 		Port: &v1alpha3.Port{
 			Number:   80,
-			Protocol: string(model.ProtocolHTTP),
+			Protocol: string(protocol.HTTP),
 			Name:     fmt.Sprintf("http-80-i-%s-%s", name, namespace),
 		},
 		Hosts: []string{"*"},
 	})
 
-	newName := name + "-" + model.IstioIngressGatewayName
-	newNamespace := model.IstioIngressNamespace
+	newName := name + "-" + constants.IstioIngressGatewayName
+	newNamespace := constants.IstioIngressNamespace
 
 	gw := resource.Entry{
 		ID: resource.VersionedKey{
 			Key: resource.Key{
-				FullName: resource.FullNameFromNamespaceAndName(newNamespace, newName),
-				TypeURL:  metadata.VirtualService.TypeURL,
+				FullName:   resource.FullNameFromNamespaceAndName(newNamespace, newName),
+				Collection: metadata.IstioNetworkingV1alpha3Virtualservices.Collection,
 			},
-			Version:    key.Version,
-			CreateTime: key.CreateTime,
+			Version: key.Version,
 		},
-		Item: gateway,
+		Metadata: meta,
+		Item:     gateway,
 	}
 
 	return gw

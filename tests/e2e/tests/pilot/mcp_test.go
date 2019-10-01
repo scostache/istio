@@ -17,36 +17,43 @@ package pilot
 import (
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	"github.com/onsi/gomega"
 
-	mcp "istio.io/api/mcp/v1alpha1"
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
+
 	mixerEnv "istio.io/istio/mixer/test/client/env"
 	"istio.io/istio/pilot/pkg/bootstrap"
-	"istio.io/istio/pilot/pkg/model"
-	mcpserver "istio.io/istio/pkg/mcp/server"
-	mockmcp "istio.io/istio/tests/e2e/tests/pilot/mock/mcp"
+	srmemory "istio.io/istio/pilot/pkg/serviceregistry/memory"
+	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/mcp/source"
+	"istio.io/istio/pkg/mcp/testing/groups"
 	"istio.io/istio/tests/util"
 
 	// Import the resource package to pull in all proto types.
-	_ "istio.io/istio/galley/pkg/metadata"
+	_ "istio.io/istio/galley/pkg/config/processor/metadata"
+	"istio.io/istio/pkg/mcp/snapshot"
+	mcptesting "istio.io/istio/pkg/mcp/testing"
 	"istio.io/istio/pkg/test/env"
 )
 
 const (
 	pilotDebugPort = 5555
 	pilotGrpcPort  = 15010
+
+	ingressGatewaySvc = "mcp-ingress.istio-system.svc.cluster.local"
 )
 
+var gatewaySvc = srmemory.MakeService(ingressGatewaySvc, "11.0.0.1")
+var gatewayInstance = srmemory.MakeIP(gatewaySvc, 0)
 var fakeCreateTime *types.Timestamp
+var fakeCreateTime2 = time.Date(2018, time.January, 1, 2, 3, 4, 5, time.UTC)
 
 func TestPilotMCPClient(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
@@ -60,6 +67,16 @@ func TestPilotMCPClient(t *testing.T) {
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	defer mcpServer.Close()
 
+	sn := snapshot.NewInMemoryBuilder()
+	for _, m := range schemas.Istio {
+		sn.SetVersion(m.Collection, "v0")
+	}
+
+	sn.SetEntry(schemas.Gateway.Collection, "some-name", "v1", fakeCreateTime2, nil, nil, firstGateway)
+	sn.SetEntry(schemas.Gateway.Collection, "some-other name", "v1", fakeCreateTime2, nil, nil, secondGateway)
+
+	mcpServer.Cache.SetSnapshot(groups.Default, sn.Build())
+
 	tearDown := initLocalPilotTestEnv(t, mcpServer.Port, pilotGrpcPort, pilotDebugPort)
 	defer tearDown()
 
@@ -68,7 +85,7 @@ func TestPilotMCPClient(t *testing.T) {
 	}, "30s", "1s").Should(gomega.ContainSubstring("gateway"))
 
 	t.Log("run edge router envoy...")
-	gateway := runEnvoy(t, pilotGrpcPort, pilotDebugPort)
+	gateway := runEnvoy(t, "router~"+gatewayInstance+"~x~x", pilotGrpcPort, pilotDebugPort)
 	defer gateway.TearDown()
 
 	t.Log("check that envoy is listening on the configured gateway...")
@@ -79,76 +96,20 @@ func TestPilotMCPClient(t *testing.T) {
 	}, "180s", "1s").Should(gomega.Succeed())
 }
 
-func mcpServerResponse(req *mcp.MeshConfigRequest) (*mcpserver.WatchResponse, mcpserver.CancelWatchFunc) {
-	var cancelFunc mcpserver.CancelWatchFunc
-	cancelFunc = func() {
-		log.Printf("watch canceled for %s\n", req.GetTypeUrl())
+func runMcpServer() (*mcptesting.Server, error) {
+	collections := make([]string, len(schemas.Istio))
+	for i, m := range schemas.Istio {
+		collections[i] = m.Collection
 	}
-	if req.GetTypeUrl() == fmt.Sprintf("type.googleapis.com/%s", model.Gateway.MessageName) {
-		marshaledFirstGateway, err := proto.Marshal(firstGateway)
-		if err != nil {
-			log.Fatalf("marshaling gateway %s\n", err)
-		}
-		marshaledSecondGateway, err := proto.Marshal(secondGateway)
-		if err != nil {
-			log.Fatalf("marshaling gateway %s\n", err)
-		}
-
-		return &mcpserver.WatchResponse{
-			Version: req.GetVersionInfo(),
-			TypeURL: req.GetTypeUrl(),
-			Envelopes: []*mcp.Envelope{
-				{
-					Metadata: &mcp.Metadata{
-						Name:       "some-name",
-						CreateTime: fakeCreateTime,
-					},
-					Resource: &types.Any{
-						TypeUrl: req.GetTypeUrl(),
-						Value:   marshaledFirstGateway,
-					},
-				},
-				{
-					Metadata: &mcp.Metadata{
-						Name:       "some-other-name",
-						CreateTime: fakeCreateTime,
-					},
-					Resource: &types.Any{
-						TypeUrl: req.GetTypeUrl(),
-						Value:   marshaledSecondGateway,
-					},
-				},
-			},
-		}, cancelFunc
-	}
-	return &mcpserver.WatchResponse{
-		Version:   req.GetVersionInfo(),
-		TypeURL:   req.GetTypeUrl(),
-		Envelopes: []*mcp.Envelope{},
-	}, cancelFunc
+	return mcptesting.NewServer(0, source.CollectionOptionsFromSlice(collections))
 }
 
-func runMcpServer() (*mockmcp.Server, error) {
-	supportedTypes := make([]string, len(model.IstioConfigTypes))
-	for i, m := range model.IstioConfigTypes {
-		supportedTypes[i] = fmt.Sprintf("type.googleapis.com/%s", m.MessageName)
-	}
-
-	server, err := mockmcp.NewServer(supportedTypes, mcpServerResponse)
-	if err != nil {
-		return nil, err
-	}
-
-	return server, nil
-}
-
-func runEnvoy(t *testing.T, grpcPort, debugPort uint16) *mixerEnv.TestSetup {
+func runEnvoy(t *testing.T, nodeID string, grpcPort, debugPort uint16) *mixerEnv.TestSetup {
 	t.Log("create a new envoy test environment")
 	tmpl, err := ioutil.ReadFile(env.IstioSrc + "/tests/testdata/cf_bootstrap_tmpl.json")
 	if err != nil {
 		t.Fatal("Can't read bootstrap template", err)
 	}
-	nodeIDGateway := "router~x~x~x"
 
 	gateway := mixerEnv.NewTestSetup(25, t)
 	gateway.SetNoMixer(true)
@@ -159,11 +120,11 @@ func runEnvoy(t *testing.T, grpcPort, debugPort uint16) *mixerEnv.TestSetup {
 	gateway.Ports().PilotGrpcPort = grpcPort
 	gateway.Ports().PilotHTTPPort = debugPort
 	gateway.EnvoyConfigOpt = map[string]interface{}{
-		"NodeID": nodeIDGateway,
+		"NodeID": nodeID,
 	}
 	gateway.EnvoyTemplate = string(tmpl)
 	gateway.EnvoyParams = []string{
-		"--service-node", nodeIDGateway,
+		"--service-node", nodeID,
 		"--service-cluster", "x",
 	}
 	if err := gateway.SetUp(); err != nil {
@@ -176,13 +137,18 @@ func initLocalPilotTestEnv(t *testing.T, mcpPort, grpcPort, debugPort int) util.
 	mixerEnv.NewTestSetup(mixerEnv.PilotMCPTest, t)
 	debugAddr := fmt.Sprintf("127.0.0.1:%d", debugPort)
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", grpcPort)
-	_, tearDown := util.EnsureTestServer(addMcpAddrs(mcpPort), setupPilotDiscoveryHTTPAddr(debugAddr), setupPilotDiscoveryGrpcAddr(grpcAddr))
-	return tearDown
+	_, teardown := util.EnsureTestServer(addMcpAddrs(mcpPort), setupPilotDiscoveryHTTPAddr(debugAddr), setupPilotDiscoveryGrpcAddr(grpcAddr))
+	return teardown
 }
 
 func addMcpAddrs(mcpServerPort int) func(*bootstrap.PilotArgs) {
 	return func(arg *bootstrap.PilotArgs) {
-		arg.MCPServerAddrs = []string{fmt.Sprintf("mcp://127.0.0.1:%d", mcpServerPort)}
+		if arg.MeshConfig == nil {
+			arg.MeshConfig = &meshconfig.MeshConfig{}
+		}
+		arg.MeshConfig.ConfigSources = []*meshconfig.ConfigSource{
+			{Address: fmt.Sprintf("127.0.0.1:%d", mcpServerPort)},
+		}
 	}
 }
 
@@ -212,7 +178,7 @@ func curlPilot(apiEndpoint string) (string, error) {
 
 var firstGateway = &networking.Gateway{
 	Servers: []*networking.Server{
-		&networking.Server{
+		{
 			Port: &networking.Port{
 				Name:     "http-8099",
 				Number:   8099,
@@ -227,7 +193,7 @@ var firstGateway = &networking.Gateway{
 
 var secondGateway = &networking.Gateway{
 	Servers: []*networking.Server{
-		&networking.Server{
+		{
 			Port: &networking.Port{
 				Name:     "tcp-880",
 				Number:   880,

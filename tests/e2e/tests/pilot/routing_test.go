@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-multierror"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/tests/util"
+	"istio.io/pkg/log"
 )
 
 func TestRoutes(t *testing.T) {
@@ -245,10 +245,10 @@ func TestRoutes(t *testing.T) {
 					testName := fmt.Sprintf("%s from %s cluster", c.testName, cluster)
 					runRetriableTest(t, testName, 5, func() error {
 						reqURL := fmt.Sprintf("%s://%s/%s", c.scheme, c.dst, c.src)
-						resp := ClientRequest(cluster, c.src, reqURL, samples, fmt.Sprintf("-key %s -val %s", c.headerKey, c.headerVal))
+						resp := ClientRequest(cluster, c.src, reqURL, samples, fmt.Sprintf("--key %s --val %s", c.headerKey, c.headerVal))
 						count := make(map[string]int)
 						for _, elt := range resp.Version {
-							count[elt] = count[elt] + 1
+							count[elt]++
 						}
 						log.Infof("request counts %v", count)
 						epsilon := 10
@@ -298,7 +298,7 @@ func TestRouteFaultInjection(t *testing.T) {
 			reqURL := "http://c/a"
 
 			start := time.Now()
-			resp := ClientRequest(cluster, "a", reqURL, 1, "-key version -val v2")
+			resp := ClientRequest(cluster, "a", reqURL, 1, "--key version --val v2")
 			elapsed := time.Since(start)
 
 			statusCode := ""
@@ -338,7 +338,7 @@ func TestRouteRedirectInjection(t *testing.T) {
 			targetPath := "/new/path"
 
 			reqURL := "http://c/a"
-			resp := ClientRequest(cluster, "a", reqURL, 1, "-key testredirect -val enabled")
+			resp := ClientRequest(cluster, "a", reqURL, 1, "--key testredirect --val enabled")
 			if !resp.IsHTTPOk() {
 				return fmt.Errorf("redirect failed: response status code: %v, expected 200", resp.Code)
 			}
@@ -366,36 +366,6 @@ func TestRouteRedirectInjection(t *testing.T) {
 	}
 }
 
-func TestRouteMirroring(t *testing.T) {
-	logs := newAccessLogs()
-	cfgs := &deployableConfig{
-		Namespace:  tc.Kube.Namespace,
-		YamlFiles:  []string{"testdata/networking/v1alpha3/rule-default-route-mirrored.yaml"},
-		kubeconfig: tc.Kube.KubeConfig,
-	}
-	if err := cfgs.Setup(); err != nil {
-		t.Fatal(err)
-	}
-	defer cfgs.Teardown()
-
-	reqURL := "http://c/a"
-	for cluster := range tc.Kube.Clusters {
-		for i := 1; i <= 100; i++ {
-			resp := ClientRequest(cluster, "a", reqURL, 1, fmt.Sprintf("-key X-Request-Id -val %d", i))
-			logEntry := fmt.Sprintf("HTTP request from a in %s cluster to c.istio-system.svc.cluster.local:80", cluster)
-			if len(resp.ID) > 0 {
-				id := resp.ID[0]
-				logs.add(cluster, "c", id, logEntry)
-				logs.add(cluster, "b", id, logEntry) // Request should also be mirrored here
-			}
-		}
-	}
-
-	t.Run("check", func(t *testing.T) {
-		logs.checkLogs(t)
-	})
-}
-
 // Inject a fault filter in a normal path and check if the filters are triggered
 func TestEnvoyFilterConfigViaCRD(t *testing.T) {
 	cfgs := &deployableConfig{
@@ -411,7 +381,7 @@ func TestEnvoyFilterConfigViaCRD(t *testing.T) {
 	for cluster := range tc.Kube.Clusters {
 		runRetriableTest(t, "v1alpha3", 5, func() error {
 			reqURL := "http://c/a"
-			resp := ClientRequest(cluster, "a", reqURL, 1, "-key envoyfilter-test -val foobar123")
+			resp := ClientRequest(cluster, "a", reqURL, 1, "--key envoyfilter-test --val foobar123")
 
 			statusCode := ""
 			if len(resp.Code) > 0 {
@@ -521,7 +491,7 @@ func TestHeadersManipulations(t *testing.T) {
 				"dst-res-replace:to-be-replaced," +
 				"dst-res-remove:to-be-removed"
 
-			extra := "-headers istio-custom-req-header-remove:to-be-removed," +
+			extra := "--headers istio-custom-req-header-remove:to-be-removed," +
 				"istio-custom-dest-req-header-remove:to-be-removed," +
 				"req-append:sent-by-client," +
 				"req-replace:to-be-replaced," +
@@ -654,11 +624,9 @@ func TestHeadersManipulations(t *testing.T) {
 	}
 }
 
-func TestDestinationRuleConfigScope(t *testing.T) {
-	samples := 100
-
+func TestDestinationRuleExportTo(t *testing.T) {
 	var cfgs []*deployableConfig
-	applyRuleFunc := func(t *testing.T, namesapces, ruleYamls []string) {
+	applyRuleFunc := func(t *testing.T, ruleYamls map[string][]string) {
 		// Delete the previous rule if there was one. No delay on the teardown, since we're going to apply
 		// a delay when we push the new config.
 		for _, cfg := range cfgs {
@@ -671,11 +639,11 @@ func TestDestinationRuleConfigScope(t *testing.T) {
 		}
 
 		cfgs = make([]*deployableConfig, 0)
-		for i, ns := range namesapces {
-			// Apply the new rule
+		for ns, rules := range ruleYamls {
+			// Apply the new rules in the namespace
 			cfg := &deployableConfig{
 				Namespace:  ns,
-				YamlFiles:  []string{ruleYamls[i]},
+				YamlFiles:  rules,
 				kubeconfig: tc.Kube.KubeConfig,
 			}
 			if err := cfg.Setup(); err != nil {
@@ -693,51 +661,54 @@ func TestDestinationRuleConfigScope(t *testing.T) {
 		}
 	}()
 
+	// Create the namespaces
+	// NOTE: Use different namespaces for each test to avoid
+	// collision. Namespace deletion takes time. If the other test
+	// starts before this namespace is deleted, namespace creation in the other test will fail.
+	for _, ns := range []string{"dns1", "dns2"} {
+		if err := util.CreateNamespace(ns, tc.Kube.KubeConfig); err != nil {
+			t.Errorf("Unable to create namespace %s: %v", ns, err)
+		}
+		defer func(ns string) {
+			if err := util.DeleteNamespace(ns, tc.Kube.KubeConfig); err != nil {
+				t.Errorf("Failed to delete namespace %s", ns)
+			}
+		}(ns)
+	}
+
 	cases := []struct {
 		testName        string
-		description     string
-		configs         []string
-		namespaces      []string
-		scheme          string
+		rules           map[string][]string
 		src             string
 		dst             string
 		expectedSuccess bool
-		operation       string
 		onFailure       func()
 	}{
-		{
-			testName:        "private destination rule in same namespace",
-			description:     "routing all traffic to c-v1",
-			configs:         []string{"destination-rule-c-private.yaml"},
-			namespaces:      []string{tc.Kube.Namespace},
-			scheme:          "http",
-			src:             "a",
-			dst:             "c",
-			expectedSuccess: true,
-			operation:       "c.istio-system.svc.cluster.local:80/*",
-		},
+		// TODO: this test cannot be enabled until we start running e2e tests in multiple namespaces or
+		// in a namespace other than istio-system - which happens to be the config root namespace
+		// only public rules work in the config root namespace
+		//{
+		//	testName:        "private destination rule in same namespace",
+		//	rules:           map[string][]string{tc.Kube.Namespace: {"destination-rule-c-private.yaml"}},
+		//	src:             "a",
+		//	dst:             "c",
+		//	expectedSuccess: true,
+		//},
 		{
 			testName:        "private destination rule in different namespaces",
-			description:     "can not apply private destination rule",
-			configs:         []string{"destination-rule-c-private.yaml"},
-			namespaces:      []string{"test-another-ns1"},
-			scheme:          "http",
+			rules:           map[string][]string{"dns1": {"destination-rule-c-private.yaml"}},
 			src:             "a",
 			dst:             "c",
 			expectedSuccess: false,
-			operation:       "c.istio-system.svc.cluster.local:80/*",
 		},
-		{
-			testName:        "private rule in a namespace overrides public rule in another namespace",
-			description:     "routing all traffic to c-v1",
-			configs:         []string{"destination-rule-c-private.yaml", "destination-rule-c-non-exist.yaml"},
-			namespaces:      []string{tc.Kube.Namespace, "test-another-ns2"},
-			scheme:          "http",
-			src:             "a",
-			dst:             "c",
-			expectedSuccess: true,
-			operation:       "c.istio-system.svc.cluster.local:80/*",
-		},
+		// TODO: These two cases cannot be tested reliably until the EDS issue with
+		// destination rules is fixed. https://github.com/istio/istio/issues/10817
+		//{
+		//	testName:        "private rule in a namespace overrides public rule in another namespace",
+		//},
+		//{
+		//	testName:        "public rule in service's namespace overrides public rule in another namespace",
+		//},
 	}
 
 	t.Run("v1alpha3", func(t *testing.T) {
@@ -756,28 +727,21 @@ func TestDestinationRuleConfigScope(t *testing.T) {
 		for _, c := range cases {
 			// Run each case in a function to scope the configuration's lifecycle.
 			func() {
-				for i, ns := range c.namespaces {
-					if ns != tc.Kube.Namespace {
-						if err := util.CreateNamespace(ns, tc.Kube.KubeConfig); err != nil {
-							t.Errorf("Unable to create namespace %s: %v", ns, err)
-						}
-						defer func(ns string) {
-							if err := util.DeleteNamespace(ns, tc.Kube.KubeConfig); err != nil {
-								t.Errorf("Failed to delete namespace %s", ns)
-							}
-						}(ns)
+				for _, yamls := range c.rules {
+					for i, yaml := range yamls {
+						ruleYaml := fmt.Sprintf("testdata/networking/v1alpha3/%s", yaml)
+						yamls[i] = maybeAddTLSForDestinationRule(tc, ruleYaml)
 					}
-					ruleYaml := fmt.Sprintf("testdata/networking/v1alpha3/%s", c.configs[i])
-					c.configs[i] = maybeAddTLSForDestinationRule(tc, ruleYaml)
 				}
-
-				applyRuleFunc(t, c.namespaces, c.configs)
+				applyRuleFunc(t, c.rules)
+				// Wait a few seconds so that the older proxy listeners get overwritten
+				time.Sleep(10 * time.Second)
 
 				for cluster := range tc.Kube.Clusters {
 					testName := fmt.Sprintf("%s from %s cluster", c.testName, cluster)
 					runRetriableTest(t, testName, 5, func() error {
-						reqURL := fmt.Sprintf("%s://%s/%s", c.scheme, c.dst, c.src)
-						resp := ClientRequest(cluster, c.src, reqURL, samples, "")
+						reqURL := fmt.Sprintf("http://%s/%s", c.dst, c.src)
+						resp := ClientRequest(cluster, c.src, reqURL, 1, "")
 						if c.expectedSuccess && !resp.IsHTTPOk() {
 							return fmt.Errorf("failed request %s, %v", reqURL, resp.Code)
 						}
@@ -788,6 +752,139 @@ func TestDestinationRuleConfigScope(t *testing.T) {
 					}, c.onFailure)
 				}
 			}()
+		}
+	})
+}
+
+func TestSidecarScope(t *testing.T) {
+	var cfgs []*deployableConfig
+	applyRuleFunc := func(t *testing.T, ruleYamls map[string][]string) {
+		// Delete the previous rule if there was one. No delay on the teardown, since we're going to apply
+		// a delay when we push the new config.
+		for _, cfg := range cfgs {
+			if cfg != nil {
+				if err := cfg.TeardownNoDelay(); err != nil {
+					t.Fatal(err)
+				}
+				cfg = nil
+			}
+		}
+
+		cfgs = make([]*deployableConfig, 0)
+		for ns, rules := range ruleYamls {
+			// Apply the new rules in the namespace
+			cfg := &deployableConfig{
+				Namespace:  ns,
+				YamlFiles:  rules,
+				kubeconfig: tc.Kube.KubeConfig,
+			}
+			if err := cfg.Setup(); err != nil {
+				t.Fatal(err)
+			}
+			cfgs = append(cfgs, cfg)
+		}
+	}
+	// Upon function exit, delete the active rule.
+	defer func() {
+		for _, cfg := range cfgs {
+			if cfg != nil {
+				_ = cfg.Teardown()
+			}
+		}
+	}()
+
+	rules := make(map[string][]string)
+	rules[tc.Kube.Namespace] = []string{"testdata/networking/v1alpha3/sidecar-scope-ns1-ns2.yaml"}
+	rules["ns1"] = []string{
+		"testdata/networking/v1alpha3/service-entry-http-scope-public.yaml",
+		"testdata/networking/v1alpha3/service-entry-http-scope-private.yaml",
+		"testdata/networking/v1alpha3/virtualservice-http-scope-public.yaml",
+		"testdata/networking/v1alpha3/virtualservice-http-scope-private.yaml",
+	}
+	rules["ns2"] = []string{"testdata/networking/v1alpha3/service-entry-tcp-scope-public.yaml"}
+
+	// Create the namespaces and install the rules in each namespace
+	for _, ns := range []string{"ns1", "ns2"} {
+		if err := util.CreateNamespace(ns, tc.Kube.KubeConfig); err != nil {
+			t.Errorf("Unable to create namespace %s: %v", ns, err)
+		}
+		defer func(ns string) {
+			if err := util.DeleteNamespace(ns, tc.Kube.KubeConfig); err != nil {
+				t.Errorf("Failed to delete namespace %s", ns)
+			}
+		}(ns)
+	}
+	applyRuleFunc(t, rules)
+	// Wait a few seconds so that the older proxy listeners get overwritten
+	time.Sleep(10 * time.Second)
+
+	cases := []struct {
+		testName    string
+		reqURL      string
+		host        string
+		expectedHdr *regexp.Regexp
+		reachable   bool
+		onFailure   func()
+	}{
+		{
+			testName:  "cannot reach services if not imported",
+			reqURL:    "http://c/a",
+			host:      "c",
+			reachable: false,
+		},
+		{
+			testName: "ns1: http://bookinfo.com:9999 reachable",
+			// Assume bookinfo.com is resolved to 192.0.2.1
+			reqURL:      "http://192.0.2.1:9999/a",
+			host:        "bookinfo.com:9999",
+			expectedHdr: regexp.MustCompile("(?i) scope=public"),
+			reachable:   true,
+		},
+		{
+			testName: "ns1: http://private.com:9999 not reachable",
+			// Assume private.com is resolved to 192.0.2.2
+			reqURL:    "http://192.0.2.2:9999/a",
+			host:      "private.com:9999",
+			reachable: false,
+		},
+		{
+			testName: "ns2: service.tcp.com:8888 reachable",
+			// Assume tcp.com is resolved to 192.0.2.255 which is defined in service-entry-tcp-scope-public.yaml
+			reqURL:    "http://192.0.2.255:8888/a",
+			host:      "tcp.com",
+			reachable: true,
+		},
+		{
+			testName:  "ns1: bookinfo.com:9999 reachable via egress TCP listener 7.7.7.7:23145",
+			reqURL:    "http://7.7.7.7:23145/a",
+			host:      "bookinfo.com:9999",
+			reachable: true,
+		},
+	}
+
+	t.Run("v1alpha3", func(t *testing.T) {
+		for _, c := range cases {
+			for cluster := range tc.Kube.Clusters {
+				testName := fmt.Sprintf("%s from %s cluster", c.testName, cluster)
+				runRetriableTest(t, testName, 5, func() error {
+					resp := ClientRequest(cluster, "a", c.reqURL, 1, fmt.Sprintf("--key Host --val %s", c.host))
+					if c.reachable && !resp.IsHTTPOk() {
+						return fmt.Errorf("cannot reach %s, %v", c.reqURL, resp.Code)
+					}
+
+					if !c.reachable && resp.IsHTTPOk() {
+						return fmt.Errorf("expected request %s to fail, but got success", c.reqURL)
+					}
+
+					if c.reachable && c.expectedHdr != nil {
+						found := len(c.expectedHdr.FindAllStringSubmatch(resp.Body, -1))
+						if found != 1 {
+							return fmt.Errorf("public virtualService for %s is not in effect", c.reqURL)
+						}
+					}
+					return nil
+				}, c.onFailure)
+			}
 		}
 	})
 }

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2019 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -22,16 +23,13 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
-	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
-	"istio.io/istio/pkg/collateral"
-	"istio.io/istio/pkg/ctrlz"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/probe"
-	"istio.io/istio/pkg/version"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	pkgcmd "istio.io/istio/pkg/cmd"
+	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/security/pkg/caclient"
 	"istio.io/istio/security/pkg/cmd"
 	"istio.io/istio/security/pkg/k8s/controller"
@@ -41,12 +39,21 @@ import (
 	"istio.io/istio/security/pkg/registry/kube"
 	caserver "istio.io/istio/security/pkg/server/ca"
 	"istio.io/istio/security/pkg/server/monitoring"
+	"istio.io/pkg/collateral"
+	"istio.io/pkg/ctrlz"
+	"istio.io/pkg/env"
+	"istio.io/pkg/log"
+	"istio.io/pkg/probe"
+	"istio.io/pkg/version"
 )
 
 type cliOptions struct { // nolint: maligned
-	listenedNamespace       string
-	istioCaStorageNamespace string
-	kubeConfigFile          string
+	// Comma separated string containing all listened namespaces
+	listenedNamespaces        string
+	enableNamespacesByDefault bool
+	istioCaStorageNamespace   string
+	kubeConfigFile            string
+	readSigningCertOnly       bool
 
 	certChainFile   string
 	signingCertFile string
@@ -59,18 +66,21 @@ type cliOptions struct { // nolint: maligned
 	workloadCertTTL    time.Duration
 	maxWorkloadCertTTL time.Duration
 	// The length of certificate rotation grace period, configured as the ratio of the certificate TTL.
+	// If workloadCertGracePeriodRatio is 0.2, and cert TTL is 24 hours, then the rotation will happen
+	// after 24*(1-0.2) hours since the cert is issued.
 	workloadCertGracePeriodRatio float32
 	// The minimum grace period for workload cert rotation.
 	workloadCertMinGracePeriod time.Duration
 
-	// TODO(incfly): delete this field once we deprecate flag --grpc-hostname.
-	grpcHostname string
 	// Comma separated string containing all possible host name that clients may use to connect to.
-	grpcHosts string
-	grpcPort  int
+	grpcHosts  string
+	grpcPort   int
+	serverOnly bool
 
 	// Whether the CA signs certificates for other CAs.
 	signCACerts bool
+	// Whether to generate PKCS#8 private keys.
+	pkcs8Keys bool
 
 	cAClientConfig caclient.Config
 
@@ -99,6 +109,9 @@ type cliOptions struct { // nolint: maligned
 
 	// Enable dual-use certs - SPIFFE in SAN and in CommonName
 	dualUse bool
+
+	// Whether SDS is enabled on.
+	sdsEnabled bool
 }
 
 var (
@@ -138,45 +151,61 @@ func fatalf(template string, args ...interface{}) {
 }
 
 func init() {
+	initCLI()
+	initEnvVars()
+}
+
+func initCLI() {
 	flags := rootCmd.Flags()
 	// General configuration.
-	flags.StringVar(&opts.listenedNamespace, "listened-namespace", "",
-		"Select a namespace for the CA to listen to. If unspecified, Citadel tries to use the ${"+
+	flags.StringVar(&opts.listenedNamespaces, "listened-namespace", metav1.NamespaceAll, "deprecated")
+	if err := flags.MarkDeprecated("listened-namespace", "please use --listened-namespaces instead"); err != nil {
+		panic(err)
+	}
+
+	// Default to NamespaceAll, which equals to "". Kuberentes library will then watch all the namespace.
+	flags.StringVar(&opts.listenedNamespaces, "listened-namespaces", metav1.NamespaceAll,
+		"Select the namespaces for the Citadel to listen to, separated by comma. If unspecified, Citadel tries to use the ${"+
 			cmd.ListenedNamespaceKey+"} environment variable. If neither is set, Citadel listens to all namespaces.")
 	flags.StringVar(&opts.istioCaStorageNamespace, "citadel-storage-namespace", "istio-system", "Namespace where "+
 		"the Citadel pod is running. Will not be used if explicit file or other storage mechanism is specified.")
 
 	flags.StringVar(&opts.kubeConfigFile, "kube-config", "",
 		"Specifies path to kubeconfig file. This must be specified when not running inside a Kubernetes pod.")
+	flags.BoolVar(&opts.readSigningCertOnly, "read-signing-cert-only", false, "When set, Citadel only reads the self-signed signing "+
+		"key and cert from Kubernetes secret without generating one (if not exist). This flag avoids racing condition between "+
+		"multiple Citadels generating self-signed key and cert. Please make sure one and only one Citadel instance has this flag set "+
+		"to false.")
 
 	// Configuration if Citadel accepts key/cert configured through arguments.
-	flags.StringVar(&opts.certChainFile, "cert-chain", "", "Path to the certificate chain file")
-	flags.StringVar(&opts.signingCertFile, "signing-cert", "", "Path to the CA signing certificate file")
-	flags.StringVar(&opts.signingKeyFile, "signing-key", "", "Path to the CA signing key file")
-	flags.StringVar(&opts.rootCertFile, "root-cert", "", "Path to the root certificate file")
+	flags.StringVar(&opts.certChainFile, "cert-chain", "", "Path to the certificate chain file.")
+	flags.StringVar(&opts.signingCertFile, "signing-cert", "", "Path to the CA signing certificate file.")
+	flags.StringVar(&opts.signingKeyFile, "signing-key", "", "Path to the CA signing key file.")
+
+	// Both self-signed or non-self-signed Citadel may take a root certificate file with a list of root certificates.
+	flags.StringVar(&opts.rootCertFile, "root-cert", "", "Path to the root certificate file.")
 
 	// Configuration if Citadel acts as a self signed CA.
 	flags.BoolVar(&opts.selfSignedCA, "self-signed-ca", false,
 		"Indicates whether to use auto-generated self-signed CA certificate. "+
 			"When set to true, the '--signing-cert' and '--signing-key' options are ignored.")
 	flags.DurationVar(&opts.selfSignedCACertTTL, "self-signed-ca-cert-ttl", cmd.DefaultSelfSignedCACertTTL,
-		"The TTL of self-signed CA root certificate")
-	flags.StringVar(&opts.trustDomain, "trust-domain", controller.DefaultTrustDomain,
-		fmt.Sprintf("The domain serves to identify the system with spiffe (default: %s)", controller.DefaultTrustDomain))
-
+		"The TTL of self-signed CA root certificate.")
+	flags.StringVar(&opts.trustDomain, "trust-domain", "",
+		"The domain serves to identify the system with SPIFFE.")
 	// Upstream CA configuration if Citadel interacts with upstream CA.
 	flags.StringVar(&opts.cAClientConfig.CAAddress, "upstream-ca-address", "", "The IP:port address of the upstream "+
 		"CA. When set, the CA will rely on the upstream Citadel to provision its own certificate.")
-	flags.StringVar(&opts.cAClientConfig.Org, "org", "", "Organization for the cert")
+	flags.StringVar(&opts.cAClientConfig.Org, "org", "", "Organization for the certificate.")
 	flags.DurationVar(&opts.cAClientConfig.RequestedCertTTL, "requested-ca-cert-ttl", cmd.DefaultRequestedCACertTTL,
-		"The requested TTL for the workload")
-	flags.IntVar(&opts.cAClientConfig.RSAKeySize, "key-size", 2048, "Size of generated private key")
+		"The requested TTL for the CA certificate.")
+	flags.IntVar(&opts.cAClientConfig.RSAKeySize, "key-size", 2048, "Size of generated private key.")
 
 	// Certificate signing configuration.
 	flags.DurationVar(&opts.workloadCertTTL, "workload-cert-ttl", cmd.DefaultWorkloadCertTTL,
-		"The TTL of issued workload certificates")
+		"The TTL of issued workload certificates.")
 	flags.DurationVar(&opts.maxWorkloadCertTTL, "max-workload-cert-ttl", cmd.DefaultMaxWorkloadCertTTL,
-		"The max TTL of issued workload certificates")
+		"The max TTL of issued workload certificates.")
 	flags.Float32Var(&opts.workloadCertGracePeriodRatio, "workload-cert-grace-period-ratio",
 		cmd.DefaultWorkloadCertGracePeriodRatio, "The workload certificate rotation grace period, as a ratio of the "+
 			"workload certificate TTL.")
@@ -188,14 +217,14 @@ func init() {
 		"The list of hostnames for istio ca server, separated by comma.")
 	flags.IntVar(&opts.grpcPort, "grpc-port", 8060, "The port number for Citadel GRPC server. "+
 		"If unspecified, Citadel will not serve GRPC requests.")
+	flags.BoolVar(&opts.serverOnly, "server-only", false, "When set, Citadel only serves as a server without writing "+
+		"the Kubernetes secrets.")
 
-	flags.StringVar(&opts.grpcHostname, "grpc-hostname", "istio-ca", "deprecated")
-	flags.MarkDeprecated("grpc-hostname", "please use --grpc-host-identities instead")
-
-	flags.BoolVar(&opts.signCACerts, "sign-ca-certs", false, "Whether Citadel signs certificates for other CAs")
+	flags.BoolVar(&opts.signCACerts, "sign-ca-certs", false, "Whether Citadel signs certificates for other CAs.")
+	flags.BoolVar(&opts.pkcs8Keys, "pkcs8-keys", false, "Whether to generate PKCS#8 private keys.")
 
 	// Monitoring configuration
-	flags.IntVar(&opts.monitoringPort, "monitoring-port", 9093, "The port number for monitoring Citadel. "+
+	flags.IntVar(&opts.monitoringPort, "monitoring-port", 15014, "The port number for monitoring Citadel. "+
 		"If unspecified, Citadel will disable monitoring.")
 	flags.BoolVar(&opts.enableProfiling, "enable-profiling", false, "Enabling profiling when monitoring Citadel.")
 
@@ -216,6 +245,8 @@ func init() {
 	flags.BoolVar(&opts.dualUse, "experimental-dual-use",
 		false, "Enable dual-use mode. Generates certificates with a CommonName identical to the SAN.")
 
+	flags.BoolVar(&opts.sdsEnabled, "sds-enabled", false, "Whether SDS is enabled.")
+
 	rootCmd.AddCommand(version.CobraCommand())
 
 	rootCmd.AddCommand(collateral.CobraCommand(rootCmd, &doc.GenManHeader{
@@ -229,7 +260,13 @@ func init() {
 	opts.loggingOptions.AttachCobraFlags(rootCmd)
 	opts.ctrlzOptions.AttachCobraFlags(rootCmd)
 
-	cmd.InitializeFlags(rootCmd)
+	pkgcmd.AddFlags(rootCmd)
+}
+
+func initEnvVars() {
+	enableNamespacesByDefault := env.RegisterBoolVar("CITADEL_ENABLE_NAMESPACES_BY_DEFAULT", true,
+		"Determines whether unlabeled namespaces should be targeted by this Citadel instance").Get()
+	opts.enableNamespacesByDefault = enableNamespacesByDefault
 }
 
 func main() {
@@ -244,65 +281,59 @@ func fqdn() string {
 	return fmt.Sprintf("istio-citadel.%v.svc.cluster.local", opts.istioCaStorageNamespace)
 }
 
+var (
+	listenedNamespaceKeyVar = env.RegisterStringVar(cmd.ListenedNamespaceKey, "", "")
+)
+
 func runCA() {
+	verifyCommandLineOptions()
+
 	if err := log.Configure(opts.loggingOptions); err != nil {
 		fatalf("Failed to configure logging (%v)", err)
 	}
 
 	_, _ = ctrlz.Run(opts.ctrlzOptions, nil)
 
-	if value, exists := os.LookupEnv(cmd.ListenedNamespaceKey); exists {
+	if value, exists := listenedNamespaceKeyVar.Lookup(); exists {
 		// When -namespace is not set, try to read the namespace from environment variable.
-		if opts.listenedNamespace == "" {
-			opts.listenedNamespace = value
+		if opts.listenedNamespaces == "" {
+			opts.listenedNamespaces = value
 		}
-		// Use environment variable for istioCaStorageNamespace if it exists
-		opts.istioCaStorageNamespace = value
 	}
 
-	verifyCommandLineOptions()
+	listenedNamespaces := strings.Split(opts.listenedNamespaces, ",")
 
-	var webhooks map[string]controller.DNSNameEntry
+	var webhooks map[string]*controller.DNSNameEntry
 	if opts.appendDNSNames {
-		webhooks = make(map[string]controller.DNSNameEntry)
-		for i, svcAccount := range webhookServiceAccounts {
-			webhooks[svcAccount] = controller.DNSNameEntry{
-				ServiceName: webhookServiceNames[i],
-				Namespace:   opts.istioCaStorageNamespace,
-			}
-		}
-		if len(opts.customDNSNames) > 0 {
-			customNames := strings.Split(opts.customDNSNames, ",")
-			for _, customName := range customNames {
-				nameDomain := strings.Split(customName, ":")
-				if len(nameDomain) == 2 {
-					override, ok := webhooks[nameDomain[0]]
-					if ok {
-						override.CustomDomains = append(override.CustomDomains, nameDomain[1])
-					} else {
-						webhooks[nameDomain[0]] = controller.DNSNameEntry{
-							ServiceName:   nameDomain[0],
-							CustomDomains: []string{nameDomain[1]},
-						}
-					}
-				}
-			}
-		}
+		webhooks = controller.ConstructCustomDNSNames(webhookServiceAccounts,
+			webhookServiceNames, opts.istioCaStorageNamespace, opts.customDNSNames)
 	}
 
-	cs := createClientset()
-	ca := createCA(cs.CoreV1())
-	// For workloads in K8s, we apply the configured workload cert TTL.
-	sc, err := controller.NewSecretController(ca,
-		opts.workloadCertTTL, opts.trustDomain,
-		opts.workloadCertGracePeriodRatio, opts.workloadCertMinGracePeriod, opts.dualUse,
-		cs.CoreV1(), opts.signCACerts, opts.listenedNamespace, webhooks)
+	cs, err := kubelib.CreateClientset(opts.kubeConfigFile, "")
 	if err != nil {
-		fatalf("Failed to create secret controller: %v", err)
+		fatalf("Could not create k8s clientset: %v", err)
 	}
+	ca := createCA(cs.CoreV1())
 
 	stopCh := make(chan struct{})
-	sc.Run(stopCh)
+	if !opts.serverOnly {
+		log.Infof("Creating Kubernetes controller to write issued keys and certs into secret ...")
+		// For workloads in K8s, we apply the configured workload cert TTL.
+		sc, err := controller.NewSecretController(ca,
+			opts.enableNamespacesByDefault,
+			opts.workloadCertTTL,
+			opts.workloadCertGracePeriodRatio, opts.workloadCertMinGracePeriod, opts.dualUse,
+			cs.CoreV1(), opts.signCACerts, opts.pkcs8Keys, listenedNamespaces, webhooks, opts.istioCaStorageNamespace)
+		if err != nil {
+			fatalf("Failed to create secret controller: %v", err)
+		}
+		sc.Run(stopCh)
+	} else {
+		log.Info("Citadel is running in server only mode, certificates will not be propagated via secret.")
+		if opts.grpcPort <= 0 {
+			fatalf("The gRPC port must be set in server-only model.")
+		}
+	}
 
 	if opts.grpcPort > 0 {
 		// start registry if gRPC server is to be started
@@ -318,16 +349,17 @@ func runCA() {
 
 		// monitor service objects with "alpha.istio.io/kubernetes-serviceaccounts" and
 		// "alpha.istio.io/canonical-serviceaccounts" annotations
-		serviceController := kube.NewServiceController(cs.CoreV1(), opts.listenedNamespace, reg)
+		serviceController := kube.NewServiceController(cs.CoreV1(), listenedNamespaces, reg)
 		serviceController.Run(ch)
 
 		// monitor service account objects for istio mesh expansion
-		serviceAccountController := kube.NewServiceAccountController(cs.CoreV1(), opts.listenedNamespace, reg)
+		serviceAccountController := kube.NewServiceAccountController(cs.CoreV1(), listenedNamespaces, reg)
 		serviceAccountController.Run(ch)
 
 		// The CA API uses cert with the max workload cert TTL.
 		hostnames := append(strings.Split(opts.grpcHosts, ","), fqdn())
-		caServer, startErr := caserver.New(ca, opts.maxWorkloadCertTTL, opts.signCACerts, hostnames, opts.grpcPort)
+		caServer, startErr := caserver.New(ca, opts.maxWorkloadCertTTL, opts.signCACerts, hostnames,
+			opts.grpcPort, spiffe.GetTrustDomain(), opts.sdsEnabled)
 		if startErr != nil {
 			fatalf("Failed to create istio ca server: %v", startErr)
 		}
@@ -379,21 +411,12 @@ func runCA() {
 	// Blocking until receives error.
 	for {
 		select {
-		case <-monitorErrCh:
+		case err := <-monitorErrCh:
 			fatalf("Monitoring server error: %v", err)
-		case <-rotatorErrCh:
+		case err := <-rotatorErrCh:
 			fatalf("Key cert bundle rotator error: %v", err)
 		}
 	}
-}
-
-func createClientset() *kubernetes.Clientset {
-	c := generateConfig()
-	cs, err := kubernetes.NewForConfig(c)
-	if err != nil {
-		fatalf("Failed to create a clientset (error: %s)", err)
-	}
-	return cs
 }
 
 func createCA(client corev1.CoreV1Interface) *ca.IstioCA {
@@ -402,9 +425,19 @@ func createCA(client corev1.CoreV1Interface) *ca.IstioCA {
 
 	if opts.selfSignedCA {
 		log.Info("Use self-signed certificate as the CA certificate")
-		caOpts, err = ca.NewSelfSignedIstioCAOptions(opts.selfSignedCACertTTL, opts.workloadCertTTL,
-			opts.maxWorkloadCertTTL, opts.trustDomain, opts.dualUse,
-			opts.istioCaStorageNamespace, client)
+		spiffe.SetTrustDomain(spiffe.DetermineTrustDomain(opts.trustDomain, true))
+		// Abort after 20 minutes.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute*20)
+		defer cancel()
+		var checkInterval time.Duration
+		if opts.readSigningCertOnly {
+			checkInterval = ca.ReadSigningCertCheckInterval
+		} else {
+			checkInterval = -1
+		}
+		caOpts, err = ca.NewSelfSignedIstioCAOptions(ctx, opts.selfSignedCACertTTL, opts.workloadCertTTL,
+			opts.maxWorkloadCertTTL, spiffe.GetTrustDomain(), opts.dualUse,
+			opts.istioCaStorageNamespace, checkInterval, client, opts.rootCertFile)
 		if err != nil {
 			fatalf("Failed to create a self-signed Citadel (error: %v)", err)
 		}
@@ -437,14 +470,6 @@ func createCA(client corev1.CoreV1Interface) *ca.IstioCA {
 	}
 
 	return istioCA
-}
-
-func generateConfig() *rest.Config {
-	c, err := clientcmd.BuildConfigFromFlags("", opts.kubeConfigFile)
-	if err != nil {
-		fatalf("Failed to create a config (error: %s)", err)
-	}
-	return c
 }
 
 func verifyCommandLineOptions() {

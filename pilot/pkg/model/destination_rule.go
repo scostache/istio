@@ -18,13 +18,18 @@ import (
 	"fmt"
 
 	networking "istio.io/api/networking/v1alpha3"
+
+	"istio.io/istio/pkg/config/host"
 )
 
-// combineSingleDestinationRule concatenates the destRuleConfig with the existing combinedDestinationRuleMap
+// This function merges one or more destination rules for a given host string
+// into a single destination rule. Note that it does not perform inheritance style merging.
+// IOW, given three dest rules (*.foo.com, *.foo.com, *.com), calling this function for
+// each config will result in a final dest rule set (*.foo.com, and *.com).
 func (ps *PushContext) combineSingleDestinationRule(
-	combinedDestRuleHosts []Hostname,
-	combinedDestRuleMap map[Hostname]*combinedDestinationRule,
-	destRuleConfig Config) ([]Hostname, map[Hostname]*combinedDestinationRule) {
+	combinedDestRuleHosts []host.Name,
+	combinedDestRuleMap map[host.Name]*combinedDestinationRule,
+	destRuleConfig Config) []host.Name {
 	rule := destRuleConfig.Spec.(*networking.DestinationRule)
 	resolvedHost := ResolveShortnameToFQDN(rule.Host, destRuleConfig.ConfigMeta)
 
@@ -41,14 +46,13 @@ func (ps *PushContext) combineSingleDestinationRule(
 					fmt.Sprintf("Duplicate subset %s found while merging destination rules for %s",
 						subset.Name, string(resolvedHost)))
 			}
-
-			// If there is no top level policy and the incoming rule has top level
-			// traffic policy, use the one from the incoming rule.
-			if combinedRule.TrafficPolicy == nil && rule.TrafficPolicy != nil {
-				combinedRule.TrafficPolicy = rule.TrafficPolicy
-			}
 		}
-		return combinedDestRuleHosts, combinedDestRuleMap
+		// If there is no top level policy and the incoming rule has top level
+		// traffic policy, use the one from the incoming rule.
+		if combinedRule.TrafficPolicy == nil && rule.TrafficPolicy != nil {
+			combinedRule.TrafficPolicy = rule.TrafficPolicy
+		}
+		return combinedDestRuleHosts
 	}
 
 	combinedDestRuleMap[resolvedHost] = &combinedDestinationRule{
@@ -60,5 +64,5 @@ func (ps *PushContext) combineSingleDestinationRule(
 	}
 	combinedDestRuleHosts = append(combinedDestRuleHosts, resolvedHost)
 
-	return combinedDestRuleHosts, combinedDestRuleMap
+	return combinedDestRuleHosts
 }

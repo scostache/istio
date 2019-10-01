@@ -26,7 +26,8 @@ import (
 	"time"
 
 	"github.com/ghodss/yaml"
-	"github.com/gogo/googleapis/google/rpc"
+
+	rpc "istio.io/gogo-genproto/googleapis/google/rpc"
 
 	"istio.io/istio/mixer/adapter/list/config"
 	"istio.io/istio/mixer/pkg/adapter"
@@ -503,7 +504,8 @@ func TestRefreshAndPurge(t *testing.T) {
 	// wait for the list to have been populated
 	for {
 		time.Sleep(1 * time.Millisecond)
-		if h.hasData() {
+		result, _ := h.hasData()
+		if result {
 			// list has been populated
 			break
 		}
@@ -521,8 +523,9 @@ func TestRefreshAndPurge(t *testing.T) {
 	// wait for the list to have been purged
 	for {
 		time.Sleep(1 * time.Millisecond)
-		if !h.hasData() {
-			// list has been purged
+		result, err := h.hasData()
+		if !result && err != nil {
+			// list has been purged and failed to reload
 			break
 		}
 	}

@@ -15,14 +15,21 @@
 package runtime
 
 import (
-	"github.com/pkg/errors"
-
+	"context"
+	"fmt"
+	"sync"
 	"time"
 
-	"istio.io/istio/galley/pkg/metadata"
+	"istio.io/pkg/log"
+	"istio.io/pkg/timedfn"
+
+	"istio.io/istio/galley/pkg/config/monitoring"
+	"istio.io/istio/galley/pkg/config/processor/groups"
+	"istio.io/istio/galley/pkg/runtime/processing"
+	"istio.io/istio/galley/pkg/runtime/projections/serviceentry"
+	"istio.io/istio/galley/pkg/runtime/publish"
 	"istio.io/istio/galley/pkg/runtime/resource"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/mcp/snapshot"
+	"istio.io/istio/galley/pkg/util"
 )
 
 var scope = log.RegisterScope("runtime", "Galley runtime", 0)
@@ -33,177 +40,224 @@ type Processor struct {
 	// source interface for retrieving the events from.
 	source Source
 
-	// distributor interface for publishing config snapshots to.
-	distributor Distributor
-
-	// configuration for the processor
-	config *Config
-
-	// The heuristic publishing strategy
-	strategy *publishingStrategy
-
-	schema *resource.Schema
-
-	// events channel that was obtained from source
-	events chan resource.Event
-
-	// channel that gets closed during Shutdown.
-	done chan struct{}
-
-	// indicates that the State is built-up enough to warrant distribution.
 	distribute bool
 
-	// channel that signals the background process as being stopped.
-	stopped chan struct{}
+	// eventCh channel that was obtained from source
+	eventCh chan resource.Event
+
+	// handler for events.
+	handler processing.Handler
 
 	// The current in-memory configuration State
-	state *State
+	state         *State
+	stateStrategy *publish.Strategy
+
+	// Handler that generates synthetic ServiceEntry projections.
+	serviceEntryHandler *serviceentry.Handler
+
+	distributor Distributor
 
 	// hook that gets called after each event processing. Useful for testing.
 	postProcessHook postProcessHookFn
 
-	// pendingEvents counts the number of events awaiting publishing.
-	pendingEvents int64
-
 	// lastEventTime records the last time an event was received.
 	lastEventTime time.Time
 
-	// lastSnapshotTime records the last time a snapshot was published.
-	lastSnapshotTime time.Time
+	// worker handles the lifecycle of the processing worker thread.
+	worker *util.Worker
+
+	// Condition used to notify callers of AwaitFullSync that the full sync has occurred.
+	fullSyncCond *sync.Cond
 }
 
 type postProcessHookFn func()
 
 // NewProcessor returns a new instance of a Processor
 func NewProcessor(src Source, distributor Distributor, cfg *Config) *Processor {
-	return newProcessor(src, distributor, cfg, newPublishingStrategyWithDefaults(), metadata.Types, nil)
+	stateStrategy := publish.NewStrategyWithDefaults()
+
+	return newProcessor(src, cfg, stateStrategy, distributor, nil)
 }
 
 func newProcessor(
 	src Source,
-	distributor Distributor,
 	cfg *Config,
-	strategy *publishingStrategy,
-	schema *resource.Schema,
+	stateStrategy *publish.Strategy,
+	distributor Distributor,
 	postProcessHook postProcessHookFn) *Processor {
+	now := time.Now()
 
-	return &Processor{
-		source:           src,
-		distributor:      distributor,
-		config:           cfg,
-		strategy:         strategy,
-		schema:           schema,
-		postProcessHook:  postProcessHook,
-		done:             make(chan struct{}),
-		stopped:          make(chan struct{}),
-		lastEventTime:    time.Now(),
-		lastSnapshotTime: time.Now(),
+	p := &Processor{
+		stateStrategy:   stateStrategy,
+		distributor:     distributor,
+		source:          src,
+		eventCh:         make(chan resource.Event, 1024),
+		postProcessHook: postProcessHook,
+		worker:          util.NewWorker("runtime processor", scope),
+		lastEventTime:   now,
+		fullSyncCond:    sync.NewCond(&sync.Mutex{}),
 	}
+	stateListener := processing.ListenerFromFn(func(c resource.Collection) {
+		// When the state indicates a change occurred, update the publishing strategy
+		if p.distribute {
+			stateStrategy.OnChange()
+		}
+	})
+	p.state = newState(cfg, stateListener)
+
+	// Publish ServiceEntry events as soon as they occur.
+	p.serviceEntryHandler = serviceentry.NewHandler(cfg.DomainSuffix, processing.ListenerFromFn(func(_ resource.Collection) {
+		scope.Debug("Processor.process: publish serviceEntry")
+		s := p.serviceEntryHandler.BuildSnapshot()
+		p.distributor.SetSnapshot(groups.SyntheticServiceEntry, s)
+	}))
+
+	p.handler = buildDispatcher(p.state, p.serviceEntryHandler)
+
+	p.seedMesh()
+
+	return p
+}
+
+func (p *Processor) seedMesh() {
+	i, ok := p.state.config.Schema.Lookup("istio/mesh/v1alpha1/MeshConfig")
+	if !ok {
+		return
+	}
+	m := p.state.config.Mesh.Get()
+	e := resource.Event{
+		Kind: resource.Added,
+		Entry: resource.Entry{
+			Metadata: resource.Metadata{
+				CreateTime: time.Now(),
+			},
+			ID: resource.VersionedKey{
+				Key: resource.Key{
+					Collection: i.Collection,
+					//TODO Replace istio-system with appropriate name We may
+					//need to serve multiple meshconfigs.
+					FullName: resource.FullNameFromNamespaceAndName(
+						"istio-system",
+						"meshconfig"),
+				},
+				Version: "1",
+			},
+			Item: &m,
+		},
+	}
+	p.state.Handle(e)
 }
 
 // Start the processor. This will cause processor to listen to incoming events from the provider
 // and publish component configuration via the Distributor.
 func (p *Processor) Start() error {
-	scope.Info("Starting processor...")
-
-	if p.events != nil {
-		scope.Warn("Processor has already started")
-		return errors.New("already started")
+	setupFn := func() error {
+		err := p.source.Start(func(e resource.Event) {
+			p.eventCh <- e
+		})
+		if err != nil {
+			return fmt.Errorf("runtime unable to Start source: %v", err)
+		}
+		return nil
 	}
 
-	p.distribute = false
+	runFn := func(ctx context.Context) {
+		scope.Info("Starting processor...")
+		defer func() {
+			scope.Debugf("Process.process: Exiting worker thread")
+			p.source.Stop()
+			close(p.eventCh)
+			p.stateStrategy.Close()
+		}()
 
-	events, err := p.source.Start()
-	if err != nil {
-		scope.Warnf("Unable to Start source: %v", err)
-		return err
+		scope.Debug("Starting process loop")
+
+		for {
+			select {
+			case <-ctx.Done():
+				// Graceful termination.
+				scope.Debug("Processor.process: done")
+				return
+			case e := <-p.eventCh:
+				p.processEvent(e)
+			case <-p.stateStrategy.Publish:
+				scope.Debug("Processor.process: publish")
+				s := p.state.buildSnapshot()
+				p.distributor.SetSnapshot(groups.Default, s)
+			}
+
+			if p.postProcessHook != nil {
+				p.postProcessHook()
+			}
+		}
 	}
 
-	p.events = events
-	p.state = newState(p.schema, p.config)
-
-	go p.process()
-
-	return nil
+	return p.worker.Start(setupFn, runFn)
 }
 
 // Stop the processor.
 func (p *Processor) Stop() {
 	scope.Info("Stopping processor...")
-
-	if p.events == nil {
-		scope.Warnf("Processor has already stopped")
-		return
-	}
-
-	p.source.Stop()
-
-	close(p.done)
-	<-p.stopped
-
-	p.events = nil
-	p.done = nil
-	p.state = nil
-	p.distribute = false
+	p.worker.Stop()
 }
 
-func (p *Processor) process() {
-	scope.Debugf("Starting process loop")
-
-loop:
-	for {
-		select {
-
-		// Incoming events are received through p.events
-		case e := <-p.events:
-			scope.Debugf("Processor.process: event: %v", e)
-			if p.processEvent(e) {
-				scope.Debugf("Processor.process: event: %v, signaling onChange", e)
-				p.strategy.onChange()
-			}
-
-		case <-p.strategy.publish:
-			scope.Debug("Processor.process: publish")
-			p.publish()
-
-		// p.done signals the graceful Shutdown of the processor.
-		case <-p.done:
-			scope.Debug("Processor.process: done")
-			break loop
+// AwaitFullSync waits until the full sync event is received from the source. For testing purposes only.
+func (p *Processor) AwaitFullSync(timeout time.Duration) error {
+	return timedfn.WithTimeout(func() {
+		p.fullSyncCond.L.Lock()
+		defer p.fullSyncCond.L.Unlock()
+		if p.distribute {
+			// Already synced. Nothing to do.
+			return
 		}
 
-		if p.postProcessHook != nil {
-			p.postProcessHook()
-		}
-	}
-
-	p.strategy.reset()
-	close(p.stopped)
-	scope.Debugf("Process.process: Exiting process loop")
+		p.fullSyncCond.Wait()
+	}, timeout)
 }
 
-func (p *Processor) processEvent(e resource.Event) bool {
-	scope.Debugf("Incoming source event: %v", e)
-	now := time.Now()
-	recordProcessorEventProcessed(now.Sub(p.lastEventTime))
-	p.lastEventTime = now
-	p.pendingEvents++
+func (p *Processor) processEvent(e resource.Event) {
+	if scope.DebugEnabled() {
+		scope.Debugf("Incoming source event: %v", e)
+	}
+	p.recordEvent()
 
 	if e.Kind == resource.FullSync {
 		scope.Infof("Synchronization is complete, starting distribution.")
+
+		p.fullSyncCond.L.Lock()
 		p.distribute = true
-		return true
+		p.fullSyncCond.Broadcast()
+		p.fullSyncCond.L.Unlock()
+
+		p.stateStrategy.OnChange()
+		return
 	}
 
-	return p.state.apply(e) && p.distribute
+	p.handler.Handle(e)
 }
 
-func (p *Processor) publish() {
+func (p *Processor) recordEvent() {
 	now := time.Now()
-	recordProcessorSnapshotPublished(p.pendingEvents, now.Sub(p.lastSnapshotTime))
-	p.lastSnapshotTime = now
-	sn := p.state.buildSnapshot()
+	monitoring.RecordProcessorEventProcessed(now.Sub(p.lastEventTime))
+	p.lastEventTime = now
+}
 
-	p.distributor.SetSnapshot(snapshot.DefaultGroup, sn)
-	p.pendingEvents = 0
+func buildDispatcher(state *State, serviceEntryHandler processing.Handler) *processing.Dispatcher {
+	b := processing.NewDispatcherBuilder()
+
+	// Route all types to the state, except for those required by the serviceEntryHandler.
+
+	stateSchema := resource.NewSchemaBuilder().RegisterSchema(state.config.Schema).Build()
+	for _, spec := range stateSchema.All() {
+		b.Add(spec.Collection, state)
+	}
+
+	if state.config.SynthesizeServiceEntries {
+		// Route all other types to the serviceEntryHandler
+		for _, spec := range serviceentry.Schema.All() {
+			b.Add(spec.Collection, serviceEntryHandler)
+		}
+	}
+
+	return b.Build()
 }

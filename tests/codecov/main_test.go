@@ -1,3 +1,17 @@
+// Copyright 2019 Istio Authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -57,18 +71,34 @@ func TestParseThreshold(t *testing.T) {
 	if err := ioutil.WriteFile(outFile, []byte(example), 0644); err != nil {
 		t.Errorf("Failed to write example file, %v", err)
 	}
+	example2 :=
+		"#Some comments\n" +
+			"  # more comments\n" +
+			"istio.io/istio/mixer/pkg\n" +
+			" istio.io/istio/pilot/test\n" +
+			"\n"
+	outFile2 := filepath.Join(tmpDir, "outFile2")
+	if err := ioutil.WriteFile(outFile2, []byte(example2), 0644); err != nil {
+		t.Errorf("Failed to write example file, %v", err)
+	}
 
-	thresholds, err := parseThreshold(outFile)
+	thresholds, err := parseThreshold(outFile + "," + outFile2)
 	if err != nil {
 		t.Errorf("Failed to parse outFile, %v", err)
 	} else {
-		if len(thresholds) != 2 {
+		if len(thresholds) != 4 {
 			t.Error("Wrong result count from parseThresholds()")
 		}
 		if thresholds["istio.io/istio/galley/pkg/crd"] != 10.5 {
 			t.Error("Wrong result from parseThreshold()")
 		}
 		if thresholds["istio.io/istio/pilot"] != 20.2 {
+			t.Error("Wrong result from parseThreshold()")
+		}
+		if thresholds["istio.io/istio/mixer/pkg"] != 100 {
+			t.Error("Wrong result from parseThreshold()")
+		}
+		if thresholds["istio.io/istio/pilot/test"] != 100 {
 			t.Error("Wrong result from parseThreshold()")
 		}
 	}
@@ -191,10 +221,10 @@ func TestCheckDeltaGood(t *testing.T) {
 
 // Actual codecov diff test
 func TestCheckCoverage(t *testing.T) {
-	if len(*reportFile) == 0 || len(*baselineFile) == 0 || len(*thresholdFile) == 0 {
+	if len(*reportFile) == 0 || len(*baselineFile) == 0 || len(*thresholdFiles) == 0 {
 		t.Skip("Test files are not provided.")
 	}
-	err := checkCoverage(*reportFile, *baselineFile, *thresholdFile, *skipDeleted)
+	err := checkCoverage(*reportFile, *baselineFile, *thresholdFiles, *skipDeleted)
 
 	if err != nil {
 		t.Errorf("%v", err)

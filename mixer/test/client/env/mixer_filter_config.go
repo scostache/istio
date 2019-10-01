@@ -15,16 +15,15 @@
 package env
 
 import (
-	gpb "github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/ptypes/duration"
 
-	mpb "istio.io/api/mixer/v1"
-	mccpb "istio.io/api/mixer/v1/config/client"
+	mccpb "istio.io/istio/pilot/pkg/networking/plugin/mixer/client"
+	mpb "istio.io/istio/pilot/pkg/networking/plugin/mixer/client"
 )
 
 var (
 	meshIP1 = []byte{1, 1, 1, 1}
 	meshIP2 = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 204, 152, 189, 116}
-	meshIP3 = []byte{0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8}
 )
 
 // MixerFilterConf stores config for Mixer filter.
@@ -77,7 +76,6 @@ func GetDefaultHTTPClientConf() *mccpb.HttpClientConfig {
 	mfConf := &mccpb.HttpClientConfig{
 		ForwardAttributes: &mpb.Attributes{
 			Attributes: map[string]*mpb.Attributes_AttributeValue{
-				"mesh3.ip":         {Value: &mpb.Attributes_AttributeValue_BytesValue{BytesValue: meshIP3}},
 				"source.uid":       {Value: &mpb.Attributes_AttributeValue_StringValue{StringValue: "POD11"}},
 				"source.namespace": {Value: &mpb.Attributes_AttributeValue_StringValue{StringValue: "XYZ11"}},
 			},
@@ -107,9 +105,9 @@ func SetNetworPolicy(mfConf *mccpb.HttpClientConfig, open bool) {
 	}
 	mfConf.Transport.NetworkFailPolicy = &mccpb.NetworkFailPolicy{}
 	if open {
-		mfConf.Transport.NetworkFailPolicy.Policy = mccpb.FAIL_OPEN
+		mfConf.Transport.NetworkFailPolicy.Policy = mccpb.NetworkFailPolicy_FAIL_OPEN
 	} else {
-		mfConf.Transport.NetworkFailPolicy.Policy = mccpb.FAIL_CLOSE
+		mfConf.Transport.NetworkFailPolicy.Policy = mccpb.NetworkFailPolicy_FAIL_CLOSE
 	}
 }
 
@@ -165,7 +163,7 @@ func DisableTCPCheckReport(mfConf *mccpb.TcpClientConfig, disableCheck, disableR
 // SetTCPReportInterval sets TCP filter report interval in seconds
 func SetTCPReportInterval(mfConf *mccpb.TcpClientConfig, reportInterval int64) {
 	if mfConf.ReportInterval == nil {
-		mfConf.ReportInterval = &gpb.Duration{
+		mfConf.ReportInterval = &duration.Duration{
 			Seconds: reportInterval,
 		}
 	} else {
@@ -178,13 +176,13 @@ func SetStatsUpdateInterval(mfConf *MixerFilterConf, updateInterval int64) {
 	if mfConf.HTTPServerConf.Transport == nil {
 		mfConf.HTTPServerConf.Transport = &mccpb.TransportConfig{}
 	}
-	mfConf.HTTPServerConf.Transport.StatsUpdateInterval = &gpb.Duration{
+	mfConf.HTTPServerConf.Transport.StatsUpdateInterval = &duration.Duration{
 		Seconds: updateInterval,
 	}
 	if mfConf.TCPServerConf.Transport == nil {
 		mfConf.TCPServerConf.Transport = &mccpb.TransportConfig{}
 	}
-	mfConf.TCPServerConf.Transport.StatsUpdateInterval = &gpb.Duration{
+	mfConf.TCPServerConf.Transport.StatsUpdateInterval = &duration.Duration{
 		Seconds: updateInterval,
 	}
 }

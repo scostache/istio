@@ -19,6 +19,8 @@ import (
 	"os"
 	"time"
 
+	"istio.io/istio/pkg/spiffe"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,19 +28,17 @@ import (
 	"istio.io/istio/pilot/pkg/bootstrap"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pkg/cmd"
-	"istio.io/istio/pkg/collateral"
-	"istio.io/istio/pkg/ctrlz"
 	"istio.io/istio/pkg/keepalive"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/mcp/creds"
-	"istio.io/istio/pkg/version"
+	"istio.io/pkg/collateral"
+	"istio.io/pkg/ctrlz"
+	"istio.io/pkg/log"
+	"istio.io/pkg/version"
 )
 
 var (
 	serverArgs = bootstrap.PilotArgs{
-		CtrlZOptions:         ctrlz.DefaultOptions(),
-		MCPCredentialOptions: creds.DefaultOptions(),
-		KeepaliveOptions:     keepalive.DefaultOption(),
+		CtrlZOptions:     ctrlz.DefaultOptions(),
+		KeepaliveOptions: keepalive.DefaultOption(),
 	}
 
 	loggingOptions = log.DefaultOptions()
@@ -60,6 +60,8 @@ var (
 				return err
 			}
 
+			spiffe.SetTrustDomain(spiffe.DetermineTrustDomain(serverArgs.Config.ControllerOptions.TrustDomain, hasKubeRegistry()))
+
 			// Create the stop channel for all of the servers.
 			stop := make(chan struct{})
 
@@ -80,11 +82,21 @@ var (
 	}
 )
 
+// when we run on k8s, the default trust domain is 'cluster.local', otherwise it is the empty string
+func hasKubeRegistry() bool {
+	for _, r := range serverArgs.Service.Registries {
+		if serviceregistry.ServiceRegistry(r) == serviceregistry.KubernetesRegistry {
+			return true
+		}
+	}
+	return false
+}
+
 func init() {
 	discoveryCmd.PersistentFlags().StringSliceVar(&serverArgs.Service.Registries, "registries",
 		[]string{string(serviceregistry.KubernetesRegistry)},
-		fmt.Sprintf("Comma separated list of platform service registries to read from (choose one or more from {%s, %s, %s})",
-			serviceregistry.KubernetesRegistry, serviceregistry.ConsulRegistry, serviceregistry.MockRegistry))
+		fmt.Sprintf("Comma separated list of platform service registries to read from (choose one or more from {%s, %s, %s, %s})",
+			serviceregistry.KubernetesRegistry, serviceregistry.ConsulRegistry, serviceregistry.MCPRegistry, serviceregistry.MockRegistry))
 	discoveryCmd.PersistentFlags().StringVar(&serverArgs.Config.ClusterRegistriesNamespace, "clusterRegistriesNamespace", metav1.NamespaceAll,
 		"Namespace for ConfigMap which stores clusters configs")
 	discoveryCmd.PersistentFlags().StringVar(&serverArgs.Config.KubeConfig, "kubeconfig", "",
@@ -99,13 +111,12 @@ func init() {
 		"comma separated list of networking plugins to enable")
 
 	// MCP client flags
-	discoveryCmd.PersistentFlags().StringSliceVar(&serverArgs.MCPServerAddrs, "mcpServerAddrs", []string{},
-		"comma separated list of MCP server addresses with "+
-			"mcp:// (insecure) or mcps:// (secure) schema, e.g. mcps://istio-galley.istio-system.svc:9901")
-	discoveryCmd.PersistentFlags().MarkDeprecated("mcpServerAddrs", "Use --meshConfig instead, and specify in MeshConfig.ConfigSources[].Address")
-	serverArgs.MCPCredentialOptions.AttachCobraFlags(discoveryCmd)
 	discoveryCmd.PersistentFlags().IntVar(&serverArgs.MCPMaxMessageSize, "mcpMaxMsgSize", bootstrap.DefaultMCPMaxMsgSize,
 		"Max message size received by MCP's grpc client")
+	discoveryCmd.PersistentFlags().IntVar(&serverArgs.MCPInitialWindowSize, "mcpInitialWindowSize", bootstrap.DefaultMCPInitialWindowSize,
+		"Initial window size for MCP's gRPC connection")
+	discoveryCmd.PersistentFlags().IntVar(&serverArgs.MCPInitialConnWindowSize, "mcpInitialConnWindowSize", bootstrap.DefaultMCPInitialConnWindowSize,
+		"Initial connection window size for MCP's gRPC connection")
 
 	// Config Controller options
 	discoveryCmd.PersistentFlags().BoolVar(&serverArgs.Config.DisableInstallCRDs, "disable-install-crds", false,
@@ -120,6 +131,8 @@ func init() {
 		"Controller resync interval")
 	discoveryCmd.PersistentFlags().StringVar(&serverArgs.Config.ControllerOptions.DomainSuffix, "domain", "cluster.local",
 		"DNS domain suffix")
+	discoveryCmd.PersistentFlags().StringVar(&serverArgs.Config.ControllerOptions.TrustDomain, "trust-domain", "",
+		"The domain serves to identify the system with spiffe")
 	discoveryCmd.PersistentFlags().StringVar(&serverArgs.Service.Consul.ServerURL, "consulserverURL", "",
 		"URL for the Consul server")
 	discoveryCmd.PersistentFlags().DurationVar(&serverArgs.Service.Consul.Interval, "consulserverInterval", 2*time.Second,
@@ -132,8 +145,8 @@ func init() {
 		"Discovery service grpc address")
 	discoveryCmd.PersistentFlags().StringVar(&serverArgs.DiscoveryOptions.SecureGrpcAddr, "secureGrpcAddr", ":15012",
 		"Discovery service grpc address, with https")
-	discoveryCmd.PersistentFlags().StringVar(&serverArgs.DiscoveryOptions.MonitoringAddr, "monitoringAddr", ":9093",
-		"HTTP address to use for the exposing pilot self-monitoring information")
+	discoveryCmd.PersistentFlags().StringVar(&serverArgs.DiscoveryOptions.MonitoringAddr, "monitoringAddr", ":15014",
+		"HTTP address to use for pilot's self-monitoring information")
 	discoveryCmd.PersistentFlags().BoolVar(&serverArgs.DiscoveryOptions.EnableProfiling, "profile", true,
 		"Enable profiling via web interface host:port/debug/pprof")
 	discoveryCmd.PersistentFlags().BoolVar(&serverArgs.DiscoveryOptions.EnableCaching, "discoveryCache", true,
@@ -157,6 +170,7 @@ func init() {
 		Section: "pilot-discovery CLI",
 		Manual:  "Istio Pilot Discovery",
 	}))
+
 }
 
 func main() {

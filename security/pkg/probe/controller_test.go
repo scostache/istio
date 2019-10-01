@@ -19,16 +19,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gogo/googleapis/google/rpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
 
-	"istio.io/istio/pkg/probe"
+	rpc "istio.io/gogo-genproto/googleapis/google/rpc"
+
 	"istio.io/istio/security/pkg/caclient/protocol"
 	"istio.io/istio/security/pkg/caclient/protocol/mock"
 	"istio.io/istio/security/pkg/pki/ca"
 	"istio.io/istio/security/pkg/pki/util"
 	pb "istio.io/istio/security/proto"
+	"istio.io/pkg/probe"
 )
 
 func TestGcpGetServiceIdentity(t *testing.T) {
@@ -52,14 +53,15 @@ func TestGcpGetServiceIdentity(t *testing.T) {
 		err      string
 		expected string
 	}{
-		"Check success": {
+		// TODO: test successful case.
+		"Returned no cert": {
 			resp: &pb.CsrResponse{
 				IsApproved: true,
 				Status:     &rpc.Status{Code: int32(rpc.OK), Message: "OK"},
 				SignedCert: nil,
 				CertChain:  nil,
 			},
-			expected: "",
+			expected: "CSR sign failure: failed to parse cert PEM: invalid PEM encoded certificate",
 		},
 		"SendCSR failed": {
 			resp:     nil,
@@ -69,7 +71,7 @@ func TestGcpGetServiceIdentity(t *testing.T) {
 		"gRPC server is not available": {
 			resp:     nil,
 			err:      fmt.Sprintf("%v", balancer.ErrTransientFailure.Error()),
-			expected: "",
+			expected: "all SubConns are in TransientFailure",
 		},
 	}
 

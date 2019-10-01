@@ -25,6 +25,23 @@ WD=$(dirname "$0")
 WD=$(cd "$WD"; pwd)
 ROOT=$(dirname "$WD")
 
+# Local run example:
+# UPGRADE_TEST_LOCAL="true" HUB=gcr.io/istio-release \
+#   ISTIO_REL_URL=https://storage.googleapis.com/istio-release-pipeline-data/daily-build/master-20190107-09-15 \
+#   TAG=master-20190107-09-15 \
+#   prow/upgrade-tests.sh
+
+# Set up inputs needed by test_upgrade.sh
+export SOURCE_HUB=${SOURCE_HUB:-istio}
+export SOURCE_VERSION=1.2.5
+export SOURCE_RELEASE_PATH="https://github.com/istio/istio/releases/download/${SOURCE_VERSION}"
+export TARGET_HUB=${TARGET_HUB:-$HUB}
+export TARGET_VERSION=${TAG}
+export TARGET_RELEASE_PATH=${ISTIO_REL_URL}
+
+# Set to any non-empty value to use kubectl configured cluster instead of mason provisioned cluster.
+UPGRADE_TEST_LOCAL="${UPGRADE_TEST_LOCAL:-}"
+
 # This is a script to download release artifacts from monthly or daily release
 # location and kick off upgrade/downgrade tests.
 #
@@ -33,7 +50,7 @@ ROOT=$(dirname "$WD")
 #
 # Expects HUB, SOURCE_VERSION, TARGET_VERSION, SOURCE_RELEASE_PATH, and TARGET_RELEASE_PATH as inputs.
 
-echo "Testing upgrade and downgrade between ${HUB}/${SOURCE_VERSION} and ${HUB}/${TARGET_VERSION}"
+echo "Testing upgrade and downgrade between ${SOURCE_HUB}/${SOURCE_VERSION} and ${TARGET_HUB}/${TARGET_VERSION}"
 
 # shellcheck source=prow/lib.sh
 source "${ROOT}/prow/lib.sh"
@@ -45,18 +62,23 @@ download_untar_istio_release "${TARGET_RELEASE_PATH}" "${TARGET_VERSION}"
 
 # Check https://github.com/istio/test-infra/blob/master/boskos/configs.yaml
 # for existing resources types
-export RESOURCE_TYPE="${RESOURCE_TYPE:-gke-e2e-test}"
-export OWNER='upgrade-tests'
-export USE_MASON_RESOURCE="${USE_MASON_RESOURCE:-True}"
-export CLEAN_CLUSTERS="${CLEAN_CLUSTERS:-True}"
+if [ "${UPGRADE_TEST_LOCAL}" = "" ]; then
+    export RESOURCE_TYPE="${RESOURCE_TYPE:-gke-e2e-test}"
+    export OWNER='upgrade-tests'
+    export USE_MASON_RESOURCE="${USE_MASON_RESOURCE:-True}"
+    export CLEAN_CLUSTERS="${CLEAN_CLUSTERS:-True}"
 
-setup_e2e_cluster
+    setup_e2e_cluster
+else
+    echo "Running against cluster that kubectl is configured for."
+fi
 
 
 # Install fortio which is needed by the upgrade test.
 go get fortio.org/fortio
 
-
 # Kick off tests
-"${ROOT}/tests/upgrade/test_crossgrade.sh" --from_hub="${HUB}" --from_tag="${SOURCE_VERSION}" --from_path="istio-${SOURCE_VERSION}" --to_hub="${HUB}" --to_tag="${TARGET_VERSION}" --to_path="istio-${TARGET_VERSION}"
-
+"${ROOT}/tests/upgrade/test_crossgrade.sh" \
+  --from_hub="${SOURCE_HUB}" --from_tag="${SOURCE_VERSION}" --from_path="istio-${SOURCE_VERSION}" \
+  --to_hub="${TARGET_HUB}" --to_tag="${TARGET_VERSION}" --to_path="istio-${TARGET_VERSION}" \
+  --cloud="GKE"

@@ -28,14 +28,13 @@ import (
 func TestListAuthChecker(t *testing.T) {
 	testCases := []struct {
 		name         string
-		mode         AuthListMode
 		authInfo     credentials.AuthInfo
 		extractIDsFn func(exts []pkix.Extension) ([]string, error)
 		err          string
-		remove       bool // Remove the added entry
-		set          bool // Use set to add the entry
 		ids          []string
 		allowed      []string
+		mode         AuthListMode
+		remove       bool // Remove the added entry
 	}{
 		{
 			name:     "nil",
@@ -156,7 +155,7 @@ func TestListAuthChecker(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 
-			c := NewListAuthChecker()
+			c := NewListAuthChecker(DefaultListAuthCheckerOptions())
 			c.SetMode(testCase.mode)
 			if testCase.extractIDsFn != nil {
 				c.extractIDsFn = testCase.extractIDsFn
@@ -224,10 +223,10 @@ func (a *authInfo) AuthType() string {
 
 func TestListAuthChecker_Allowed(t *testing.T) {
 	cases := []struct {
-		mode   AuthListMode
 		id     string
 		testid string
 		expect bool
+		mode   AuthListMode
 	}{
 		{mode: AuthBlackList, testid: "foo", expect: true},
 		{mode: AuthBlackList, id: "foo", testid: "foo", expect: false},
@@ -239,11 +238,12 @@ func TestListAuthChecker_Allowed(t *testing.T) {
 
 	for i, c := range cases {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			checker := NewListAuthChecker()
+			options := DefaultListAuthCheckerOptions()
+			options.AuthMode = c.mode
+			checker := NewListAuthChecker(options)
 			if c.id != "" {
 				checker.Set(c.id)
 			}
-			checker.SetMode(c.mode)
 
 			result := checker.Allowed(c.testid)
 			if result != c.expect {
@@ -260,8 +260,9 @@ func TestListAuthChecker_String(t *testing.T) {
 		}
 	}()
 
-	c := NewListAuthChecker()
-	c.SetMode(AuthBlackList)
+	options := DefaultListAuthCheckerOptions()
+	options.AuthMode = AuthBlackList
+	c := NewListAuthChecker(options)
 
 	c.Set("1", "2", "3")
 

@@ -18,7 +18,7 @@ import (
 	"reflect"
 	"testing"
 
-	envoy_api_v2_route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
+	route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
 	hcfilter "github.com/envoyproxy/go-control-plane/envoy/config/filter/http/health_check/v2"
 	http_conn "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
 
@@ -50,13 +50,13 @@ func TestBuildHealthCheckFilters(t *testing.T) {
 				HTTP: []*http_conn.HttpFilter{
 					{
 						Name: "envoy.health_check",
-						ConfigType: &http_conn.HttpFilter_Config{
-							util.MessageToStruct(&hcfilter.HealthCheck{
+						ConfigType: &http_conn.HttpFilter_TypedConfig{
+							TypedConfig: util.MessageToAny(&hcfilter.HealthCheck{
 								PassThroughMode: proto.BoolTrue,
-								Headers: []*envoy_api_v2_route.HeaderMatcher{
+								Headers: []*route.HeaderMatcher{
 									{
 										Name:                 ":path",
-										HeaderMatchSpecifier: &envoy_api_v2_route.HeaderMatcher_ExactMatch{ExactMatch: "/health"},
+										HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "/health"},
 									},
 								},
 							}),
@@ -79,13 +79,13 @@ func TestBuildHealthCheckFilters(t *testing.T) {
 				HTTP: []*http_conn.HttpFilter{
 					{
 						Name: "envoy.health_check",
-						ConfigType: &http_conn.HttpFilter_Config{
-							util.MessageToStruct(&hcfilter.HealthCheck{
+						ConfigType: &http_conn.HttpFilter_TypedConfig{
+							TypedConfig: util.MessageToAny(&hcfilter.HealthCheck{
 								PassThroughMode: proto.BoolTrue,
-								Headers: []*envoy_api_v2_route.HeaderMatcher{
+								Headers: []*route.HeaderMatcher{
 									{
 										Name:                 ":path",
-										HeaderMatchSpecifier: &envoy_api_v2_route.HeaderMatcher_ExactMatch{ExactMatch: "/health"},
+										HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "/health"},
 									},
 								},
 							}),
@@ -116,13 +116,13 @@ func TestBuildHealthCheckFilters(t *testing.T) {
 				HTTP: []*http_conn.HttpFilter{
 					{
 						Name: "envoy.health_check",
-						ConfigType: &http_conn.HttpFilter_Config{
-							util.MessageToStruct(&hcfilter.HealthCheck{
+						ConfigType: &http_conn.HttpFilter_TypedConfig{
+							TypedConfig: util.MessageToAny(&hcfilter.HealthCheck{
 								PassThroughMode: proto.BoolTrue,
-								Headers: []*envoy_api_v2_route.HeaderMatcher{
+								Headers: []*route.HeaderMatcher{
 									{
 										Name:                 ":path",
-										HeaderMatchSpecifier: &envoy_api_v2_route.HeaderMatcher_ExactMatch{ExactMatch: "/ready"},
+										HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "/ready"},
 									},
 								},
 							}),
@@ -130,13 +130,13 @@ func TestBuildHealthCheckFilters(t *testing.T) {
 					},
 					{
 						Name: "envoy.health_check",
-						ConfigType: &http_conn.HttpFilter_Config{
-							util.MessageToStruct(&hcfilter.HealthCheck{
+						ConfigType: &http_conn.HttpFilter_TypedConfig{
+							TypedConfig: util.MessageToAny(&hcfilter.HealthCheck{
 								PassThroughMode: proto.BoolTrue,
-								Headers: []*envoy_api_v2_route.HeaderMatcher{
+								Headers: []*route.HeaderMatcher{
 									{
 										Name:                 ":path",
-										HeaderMatchSpecifier: &envoy_api_v2_route.HeaderMatcher_ExactMatch{ExactMatch: "/live"},
+										HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "/live"},
 									},
 								},
 							}),
@@ -168,13 +168,13 @@ func TestBuildHealthCheckFilters(t *testing.T) {
 				HTTP: []*http_conn.HttpFilter{
 					{
 						Name: "envoy.health_check",
-						ConfigType: &http_conn.HttpFilter_Config{
-							util.MessageToStruct(&hcfilter.HealthCheck{
+						ConfigType: &http_conn.HttpFilter_TypedConfig{
+							TypedConfig: util.MessageToAny(&hcfilter.HealthCheck{
 								PassThroughMode: proto.BoolTrue,
-								Headers: []*envoy_api_v2_route.HeaderMatcher{
+								Headers: []*route.HeaderMatcher{
 									{
 										Name:                 ":path",
-										HeaderMatchSpecifier: &envoy_api_v2_route.HeaderMatcher_ExactMatch{ExactMatch: "/health"},
+										HeaderMatchSpecifier: &route.HeaderMatcher_ExactMatch{ExactMatch: "/health"},
 									},
 								},
 							}),
@@ -202,7 +202,7 @@ func TestBuildHealthCheckFilters(t *testing.T) {
 
 	for _, c := range cases {
 		var filterChain plugin.FilterChain
-		buildHealthCheckFilters(&filterChain, c.probes, c.endpoint)
+		buildHealthCheckFilters(&filterChain, c.probes, c.endpoint, true)
 		if !reflect.DeepEqual(c.expected, filterChain) {
 			t.Errorf("buildHealthCheckFilters(%#v on endpoint %#v), got:\n%#v\nwanted:\n%#v\n", c.probes, c.endpoint, filterChain, c.expected)
 		}

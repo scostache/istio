@@ -19,20 +19,21 @@ import (
 	"context"
 	"strings"
 
-	"github.com/gogo/googleapis/google/rpc"
 	multierror "github.com/hashicorp/go-multierror"
 	"go.opencensus.io/stats"
+
+	rpc "istio.io/gogo-genproto/googleapis/google/rpc"
 
 	tpb "istio.io/api/mixer/adapter/model/v1beta1"
 	mixerpb "istio.io/api/mixer/v1"
 	descriptor "istio.io/api/policy/v1beta1"
 	"istio.io/istio/mixer/pkg/adapter"
 	"istio.io/istio/mixer/pkg/attribute"
-	"istio.io/istio/mixer/pkg/pool"
 	"istio.io/istio/mixer/pkg/runtime/monitoring"
 	"istio.io/istio/mixer/pkg/runtime/routing"
 	"istio.io/istio/mixer/pkg/status"
-	"istio.io/istio/pkg/log"
+	"istio.io/pkg/log"
+	"istio.io/pkg/pool"
 )
 
 const queueAllocSize = 64
@@ -104,7 +105,7 @@ func (s *session) ensureParallelism(minParallelism int) {
 	}
 }
 
-func (s *session) dispatch() error {
+func (s *session) dispatch() error { //nolint: unparam
 	// Determine namespace to scope config resolution
 	namespace := getIdentityNamespace(s.bag)
 	destinations := s.rc.Routes.GetDestinations(s.variety, namespace)
@@ -204,7 +205,7 @@ func (s *session) dispatch() error {
 		log.Warnf("Requested quota '%s' is not configured", s.quotaArgs.Quota)
 	}
 
-	// aggregate directive after filtering by attribute conditions
+	// aggregate header operations after filtering by attribute conditions
 	if s.variety == tpb.TEMPLATE_VARIETY_CHECK && status.IsOK(s.checkResult.Status) {
 		for _, directiveGroup := range destinations.Directives() {
 			if directiveGroup.Condition != nil {
@@ -233,6 +234,17 @@ func (s *session) dispatch() error {
 						log.Warnf("Failed to evaluate header value: %v", verr)
 						continue
 					}
+					if hop.Value == "" {
+						continue
+					}
+				}
+
+				// default response if RouteDirective is only action
+				if s.checkResult.IsDefault() {
+					s.checkResult = adapter.CheckResult{
+						ValidUseCount: defaultValidUseCount,
+						ValidDuration: defaultValidDuration,
+					}
 				}
 
 				if s.checkResult.RouteDirective == nil {
@@ -258,6 +270,10 @@ func (s *session) dispatchBufferedReports() {
 
 	// dispatch the buffered dispatchStates we've got
 	for k, v := range s.reportStates {
+		if len(v.instances) == 0 {
+			// do not dispatch to handler if nothing is buffered
+			continue
+		}
 		s.dispatchToHandler(v)
 		delete(s.reportStates, k)
 	}
@@ -330,7 +346,15 @@ func (s *session) waitForDispatched() {
 			if buf == nil {
 				buf = pool.GetBuffer()
 				// the first failure result's code becomes the result code for the output
+				// `buf` variable guards the first failure since it is set the first time
 				code = rpc.Code(st.Code)
+
+				// update the direct response matching the error status
+				if s.variety == tpb.TEMPLATE_VARIETY_CHECK {
+					if response := status.GetDirectHTTPResponse(st); response != nil {
+						s.handleDirectResponse(st, response)
+					}
+				}
 			} else {
 				buf.WriteString(", ")
 			}
@@ -349,5 +373,48 @@ func (s *session) waitForDispatched() {
 			s.quotaResult.Status = status.WithMessage(code, buf.String())
 		}
 		pool.PutBuffer(buf)
+	}
+}
+
+func (s *session) handleDirectResponse(st rpc.Status, response *descriptor.DirectHttpResponse) {
+	if s.checkResult.RouteDirective == nil {
+		s.checkResult.RouteDirective = &mixerpb.RouteDirective{}
+	}
+	directive := s.checkResult.RouteDirective
+	if response.Code != 0 {
+		directive.DirectResponseCode = uint32(response.Code)
+	} else {
+		directive.DirectResponseCode = uint32(status.HTTPStatusFromCode(rpc.Code(st.Code)))
+	}
+	directive.DirectResponseBody = response.Body
+	for header, value := range response.Headers {
+		if !strings.EqualFold(header, "Set-Cookie") {
+			directive.ResponseHeaderOperations = append(directive.ResponseHeaderOperations,
+				mixerpb.HeaderOperation{
+					Operation: mixerpb.REPLACE,
+					Name:      header,
+					Value:     value,
+				})
+		} else { // append Set-Cookie headers in multiple lines
+			// Folded cookie syntax can be complicated. See, for example,
+			// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie#Syntax.
+			// Unfortunately, the net/http library does not expose/support cookie parsing.
+			// Here we handle a much simpler syntax - a comma separated list of cookies.
+			// The simplification comes at the cost of preventing the use of 'Expires'
+			// cookie attribute. A more robust parser would require 100-150 LOC and could
+			// be modeled after the following JS or Java code:
+			// https://github.com/nfriedly/set-cookie-parser/blob/master/lib/set-cookie.js
+			// or
+			// https://github.com/google/j2objc/commit/16820fdbc8f76ca0c33472810ce0cb03d20efe25
+			cookies := strings.Split(value, ",")
+			for _, cv := range cookies {
+				directive.ResponseHeaderOperations = append(directive.ResponseHeaderOperations,
+					mixerpb.HeaderOperation{
+						Operation: mixerpb.APPEND,
+						Name:      header,
+						Value:     cv,
+					})
+			}
+		}
 	}
 }

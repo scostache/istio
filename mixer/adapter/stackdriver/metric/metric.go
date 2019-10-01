@@ -22,7 +22,7 @@ import (
 
 	monitoring "cloud.google.com/go/monitoring/apiv3"
 	"github.com/golang/protobuf/ptypes"
-	gax "github.com/googleapis/gax-go"
+	gax "github.com/googleapis/gax-go/v2"
 	xcontext "golang.org/x/net/context"
 	labelpb "google.golang.org/genproto/googleapis/api/label"
 	metricpb "google.golang.org/genproto/googleapis/api/metric"
@@ -47,7 +47,7 @@ import (
 type (
 
 	// createClientFunc abstracts over the creation of the stackdriver client to enable network-less testing.
-	createClientFunc func(*config.Params) (*monitoring.MetricClient, error)
+	createClientFunc func(*config.Params, adapter.Logger) (*monitoring.MetricClient, error)
 
 	// pushFunc abstracts over client.CreateTimeSeries for testing
 	pushFunc func(ctx xcontext.Context, req *monitoringpb.CreateTimeSeriesRequest, opts ...gax.CallOption) error
@@ -74,6 +74,7 @@ type (
 		client     bufferedClient
 		// We hold a ref for cleanup during Close()
 		ticker *time.Ticker
+		quit   chan struct{}
 	}
 )
 
@@ -86,6 +87,12 @@ const (
 
 	// To limit the retry attempts for time series that are failed to push.
 	maxRetryAttempt = 3
+
+	// Size of time series buffer that would trigger time series merging.
+	mergeBufferTrigger = 10000
+
+	// microsecond to introduce a small difference between start time and end time of time series interval.
+	usec = int32(1 * time.Microsecond)
 )
 
 var (
@@ -115,8 +122,8 @@ func NewBuilder(mg helper.MetadataGenerator) metric.HandlerBuilder {
 	return &builder{createClient: createClient, mg: mg}
 }
 
-func createClient(cfg *config.Params) (*monitoring.MetricClient, error) {
-	return monitoring.NewMetricClient(context.Background(), helper.ToOpts(cfg)...)
+func createClient(cfg *config.Params, logger adapter.Logger) (*monitoring.MetricClient, error) {
+	return monitoring.NewMetricClient(context.Background(), helper.ToOpts(cfg, logger)...)
 }
 
 func (b *builder) SetMetricTypes(metrics map[string]*metric.Type) {
@@ -163,10 +170,10 @@ func (b *builder) Build(ctx context.Context, env adapter.Env) (adapter.Handler, 
 	}
 
 	ticker := time.NewTicker(cfg.PushInterval)
-
+	quit := make(chan struct{})
 	var err error
 	var client *monitoring.MetricClient
-	if client, err = b.createClient(cfg); err != nil {
+	if client, err = b.createClient(cfg, env.Logger()); err != nil {
 		return nil, err
 	}
 	buffered := &buffered{
@@ -176,13 +183,17 @@ func (b *builder) Build(ctx context.Context, env adapter.Env) (adapter.Handler, 
 		m:                   sync.Mutex{},
 		l:                   env.Logger(),
 		timeSeriesBatchSize: timeSeriesBatchLimit,
+		buffer:              []*monitoringpb.TimeSeries{},
+		mergeTrigger:        mergeBufferTrigger,
+		mergedTS:            make(map[uint64]*monitoringpb.TimeSeries),
 		retryBuffer:         []*monitoringpb.TimeSeries{},
 		retryCounter:        map[uint64]int{},
 		retryLimit:          maxRetryAttempt,
 		pushInterval:        cfg.PushInterval,
+		env:                 env,
 	}
-	// We hold on to the ref to the ticker so we can stop it later
-	buffered.start(env, ticker)
+	// We hold on to the ref to the ticker so we can stop it later and quit channel to exit the daemon.
+	buffered.start(env, ticker, quit)
 	h := &handler{
 		l:          env.Logger(),
 		now:        time.Now,
@@ -190,6 +201,7 @@ func (b *builder) Build(ctx context.Context, env adapter.Env) (adapter.Handler, 
 		md:         md,
 		metricInfo: types,
 		ticker:     ticker,
+		quit:       quit,
 	}
 	return h, nil
 }
@@ -210,6 +222,7 @@ func (h *handler) HandleMetric(_ context.Context, vals []*metric.Instance) error
 		//end, _ := ptypes.TimestampProto(val.EndTime)
 		start, _ := ptypes.TimestampProto(h.now())
 		end, _ := ptypes.TimestampProto(h.now())
+		end.Nanos += usec
 
 		ts := &monitoringpb.TimeSeries{
 			Metric: &metricpb.Metric{
@@ -255,6 +268,7 @@ func (h *handler) HandleMetric(_ context.Context, vals []*metric.Instance) error
 
 func (h *handler) Close() error {
 	h.ticker.Stop()
+	close(h.quit)
 	return h.client.Close()
 }
 
@@ -271,10 +285,11 @@ func toTypedVal(val interface{}, i info) *monitoringpb.TypedValue {
 	case labelpb.LabelDescriptor_BOOL:
 		return &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_BoolValue{BoolValue: val.(bool)}}
 	case labelpb.LabelDescriptor_INT64:
-		if t, ok := val.(time.Time); ok {
-			val = t.Nanosecond() / int(time.Microsecond)
-		} else if d, ok := val.(time.Duration); ok {
-			val = d.Nanoseconds() / int64(time.Microsecond)
+		switch v := val.(type) {
+		case time.Time:
+			val = v.Nanosecond() / int(time.Microsecond)
+		case time.Duration:
+			val = v.Nanoseconds() / int64(time.Microsecond)
 		}
 		return &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_Int64Value{Int64Value: val.(int64)}}
 	default:

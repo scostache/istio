@@ -15,6 +15,7 @@
 package secretcontroller
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,18 +29,18 @@ import (
 )
 
 const secretName string = "testSecretName"
-const secretNameSpace string = "istio-system"
+const secretNamespace string = "istio-system"
 
-var testCreateControllerCalled bool
-var testDeleteControllerCalled bool
+var testCreateControllerCalled int32
+var testDeleteControllerCalled int32
 
-func testCreateController(k8sInterface kubernetes.Interface, clusterID string) error {
-	testCreateControllerCalled = true
+func testCreateController(_ kubernetes.Interface, _ string) error {
+	atomic.StoreInt32(&testCreateControllerCalled, 1)
 	return nil
 }
 
-func testDeleteController(clusterID string) error {
-	testDeleteControllerCalled = true
+func testDeleteController(_ string) error {
+	atomic.StoreInt32(&testDeleteControllerCalled, 1)
 	return nil
 }
 
@@ -48,9 +49,9 @@ func createMultiClusterSecret(k8s *fake.Clientset) error {
 	secret := v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName,
-			Namespace: secretNameSpace,
+			Namespace: secretNamespace,
 			Labels: map[string]string{
-				"istio/multiCluster": "true",
+				MultiClusterSecretLabel: "true",
 			},
 		},
 		Data: map[string][]byte{},
@@ -58,41 +59,51 @@ func createMultiClusterSecret(k8s *fake.Clientset) error {
 
 	data["testRemoteCluster"] = []byte("Test")
 	secret.Data = data
-	_, err := k8s.CoreV1().Secrets(secretNameSpace).Create(&secret)
+	_, err := k8s.CoreV1().Secrets(secretNamespace).Create(&secret)
 	return err
 }
 
 func deleteMultiClusterSecret(k8s *fake.Clientset) error {
 	var immediate int64
 
-	return k8s.CoreV1().Secrets(secretNameSpace).Delete(
+	return k8s.CoreV1().Secrets(secretNamespace).Delete(
 		secretName, &metav1.DeleteOptions{GracePeriodSeconds: &immediate})
 }
 
-func mockLoadKubeConfig(kubeconfig []byte) (*clientcmdapi.Config, error) {
+func mockLoadKubeConfig(_ []byte) (*clientcmdapi.Config, error) {
 	return &clientcmdapi.Config{}, nil
+}
+
+func mockValidateClientConfig(_ clientcmdapi.Config) error {
+	return nil
+}
+
+func mockCreateInterfaceFromClusterConfig(_ *clientcmdapi.Config) (kubernetes.Interface, error) {
+	return fake.NewSimpleClientset(), nil
 }
 
 func verifyControllerDeleted(t *testing.T, timeoutName string) {
 	pkgtest.NewEventualOpts(10*time.Millisecond, 5*time.Second).Eventually(t, timeoutName, func() bool {
-		return testDeleteControllerCalled == true
+		return atomic.LoadInt32(&testDeleteControllerCalled) == 1
 	})
 }
 
 func verifyControllerCreated(t *testing.T, timeoutName string) {
 	pkgtest.NewEventualOpts(10*time.Millisecond, 5*time.Second).Eventually(t, timeoutName, func() bool {
-		return testCreateControllerCalled == true
+		return atomic.LoadInt32(&testCreateControllerCalled) == 1
 	})
 }
 
 func Test_SecretController(t *testing.T) {
 	LoadKubeConfig = mockLoadKubeConfig
+	ValidateClientConfig = mockValidateClientConfig
+	CreateInterfaceFromClusterConfig = mockCreateInterfaceFromClusterConfig
 
 	clientset := fake.NewSimpleClientset()
 
 	// Start the secret controller and sleep to allow secret process to start.
 	err := StartSecretController(
-		clientset, testCreateController, testDeleteController, secretNameSpace)
+		clientset, testCreateController, testDeleteController, secretNamespace)
 	if err != nil {
 		t.Fatalf("Could not start secret controller: %v", err)
 	}
@@ -106,13 +117,13 @@ func Test_SecretController(t *testing.T) {
 
 	verifyControllerCreated(t, "Create remote secret controller")
 
-	if testDeleteControllerCalled != false {
+	if atomic.LoadInt32(&testDeleteControllerCalled) == 1 {
 		t.Fatalf("Test failed on create secret, delete callback function called")
 	}
 
 	// Reset test variables and delete the multicluster secret.
-	testCreateControllerCalled = false
-	testDeleteControllerCalled = false
+	atomic.StoreInt32(&testCreateControllerCalled, 0)
+	atomic.StoreInt32(&testDeleteControllerCalled, 0)
 
 	err = deleteMultiClusterSecret(clientset)
 	if err != nil {
@@ -123,7 +134,7 @@ func Test_SecretController(t *testing.T) {
 	verifyControllerDeleted(t, "delete remote secret controller")
 
 	// Test
-	if testCreateControllerCalled != false {
+	if atomic.LoadInt32(&testCreateControllerCalled) == 1 {
 		t.Fatalf("Test failed on delete secret, create callback function called")
 	}
 }

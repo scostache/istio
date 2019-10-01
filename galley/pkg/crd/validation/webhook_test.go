@@ -26,12 +26,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/ghodss/yaml"
 	admissionv1beta1 "k8s.io/api/admission/v1beta1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	v1 "k8s.io/api/core/v1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -43,9 +43,10 @@ import (
 	"istio.io/istio/mixer/pkg/config/store"
 	"istio.io/istio/pilot/pkg/config/kube/crd"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/model/test"
 	"istio.io/istio/pilot/test/mock"
+	"istio.io/istio/pkg/config/schemas"
 	"istio.io/istio/pkg/mcp/testing/testcerts"
+	testConfig "istio.io/istio/pkg/test/config"
 )
 
 const (
@@ -60,12 +61,16 @@ func (fv *fakeValidator) Validate(*store.BackendEvent) error {
 	return fv.err
 }
 
+func (fv *fakeValidator) SupportsKind(string) bool {
+	return true
+}
+
 var (
 	dummyConfig = &admissionregistrationv1beta1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "config1",
 		},
-		Webhooks: []admissionregistrationv1beta1.Webhook{
+		Webhooks: []admissionregistrationv1beta1.ValidatingWebhook{
 			{
 				Name: "hook-foo",
 				ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
@@ -94,23 +99,22 @@ var (
 		},
 	}
 
-	dummyDeployment = &extensionsv1beta1.Deployment{
+	dummyNamespace = &v1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "istio-galley",
-			Namespace: "istio-system",
-			UID:       "deadbeef",
+			Name: "istio-system",
+			UID:  "deadbeef",
 		},
 	}
 
-	dummyClient = fake.NewSimpleClientset(dummyDeployment)
+	dummyClient = fake.NewSimpleClientset(dummyNamespace)
 
 	createFakeWebhookSource   = fcache.NewFakeControllerSource
 	createFakeEndpointsSource = func() cache.ListerWatcher {
 		source := fcache.NewFakeControllerSource()
 		source.Add(&v1.Endpoints{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      dummyDeployment.Name,
-				Namespace: dummyDeployment.Namespace,
+				Name:      dummyNamespace.Name,
+				Namespace: dummyNamespace.Namespace,
 			},
 			Subsets: []v1.EndpointSubset{{
 				Addresses: []v1.EndpointAddress{{
@@ -131,7 +135,7 @@ func TestArgs_String(t *testing.T) {
 func createTestWebhook(
 	t testing.TB,
 	cl clientset.Interface,
-	fakeWebhookSource, fakeEndpointSource cache.ListerWatcher,
+	fakeEndpointSource cache.ListerWatcher,
 	config *admissionregistrationv1beta1.ValidatingWebhookConfiguration) (*Webhook, func()) {
 
 	t.Helper()
@@ -187,9 +191,10 @@ func createTestWebhook(
 		WebhookConfigFile:             configFile,
 		CACertFile:                    caFile,
 		Clientset:                     cl,
-		DeploymentName:                dummyDeployment.Name,
-		ServiceName:                   dummyDeployment.Name,
-		DeploymentAndServiceNamespace: dummyDeployment.Namespace,
+		WebhookName:                   config.Name,
+		DeploymentName:                dummyNamespace.Name,
+		ServiceName:                   dummyNamespace.Name,
+		DeploymentAndServiceNamespace: dummyNamespace.Namespace,
 	}
 	wh, err := NewWebhook(options)
 	if err != nil {
@@ -197,20 +202,17 @@ func createTestWebhook(
 		t.Fatalf("NewWebhook() failed: %v", err)
 	}
 
-	wh.createInformerWebhookSource = func(cl clientset.Interface, name string) cache.ListerWatcher {
-		return fakeWebhookSource
-	}
 	wh.createInformerEndpointSource = func(cl clientset.Interface, namespace, name string) cache.ListerWatcher {
 		return fakeEndpointSource
 	}
 
 	return wh, func() {
 		cleanup()
-		wh.stop()
+		wh.Stop()
 	}
 }
 
-func makePilotConfig(t *testing.T, i int, validConfig bool) []byte {
+func makePilotConfig(t *testing.T, i int, validConfig bool, includeBogusKey bool) []byte { // nolint: unparam
 	t.Helper()
 
 	var key string
@@ -221,7 +223,7 @@ func makePilotConfig(t *testing.T, i int, validConfig bool) []byte {
 	name := fmt.Sprintf("%s%d", "mock-config", i)
 	config := model.Config{
 		ConfigMeta: model.ConfigMeta{
-			Type: model.MockConfig.Type,
+			Type: schemas.MockConfig.Type,
 			Name: name,
 			Labels: map[string]string{
 				"key": name,
@@ -230,15 +232,15 @@ func makePilotConfig(t *testing.T, i int, validConfig bool) []byte {
 				"annotationkey": name,
 			},
 		},
-		Spec: &test.MockConfig{
+		Spec: &testConfig.MockConfig{
 			Key: key,
-			Pairs: []*test.ConfigPair{{
+			Pairs: []*testConfig.ConfigPair{{
 				Key:   key,
 				Value: strconv.Itoa(i),
 			}},
 		},
 	}
-	obj, err := crd.ConvertConfig(model.MockConfig, config)
+	obj, err := crd.ConvertConfig(schemas.MockConfig, config)
 	if err != nil {
 		t.Fatalf("ConvertConfig(%v) failed: %v", config.Name, err)
 	}
@@ -246,14 +248,25 @@ func makePilotConfig(t *testing.T, i int, validConfig bool) []byte {
 	if err != nil {
 		t.Fatalf("Marshal(%v) failed: %v", config.Name, err)
 	}
+	if includeBogusKey {
+		trial := make(map[string]interface{})
+		if err := json.Unmarshal(raw, &trial); err != nil {
+			t.Fatalf("Unmarshal(%v) failed: %v", config.Name, err)
+		}
+		trial["unexpected_key"] = "any value"
+		if raw, err = json.Marshal(&trial); err != nil {
+			t.Fatalf("re-Marshal(%v) failed: %v", config.Name, err)
+		}
+	}
 	return raw
 }
 
 func TestAdmitPilot(t *testing.T) {
-	valid := makePilotConfig(t, 0, true)
-	invalidConfig := makePilotConfig(t, 0, false)
+	valid := makePilotConfig(t, 0, true, false)
+	invalidConfig := makePilotConfig(t, 0, false, false)
+	extraKeyConfig := makePilotConfig(t, 0, true, true)
 
-	wh, cancel := createTestWebhook(t, dummyClient, createFakeWebhookSource(), createFakeEndpointsSource(), dummyConfig)
+	wh, cancel := createTestWebhook(t, dummyClient, createFakeEndpointsSource(), dummyConfig)
 	defer cancel()
 
 	cases := []struct {
@@ -266,7 +279,7 @@ func TestAdmitPilot(t *testing.T) {
 			name:  "valid create",
 			admit: wh.admitPilot,
 			in: &admissionv1beta1.AdmissionRequest{
-				Kind:      metav1.GroupVersionKind{}, // TODO
+				Kind:      metav1.GroupVersionKind{Kind: "mock"},
 				Object:    runtime.RawExtension{Raw: valid},
 				Operation: admissionv1beta1.Create,
 			},
@@ -276,9 +289,9 @@ func TestAdmitPilot(t *testing.T) {
 			name:  "valid update",
 			admit: wh.admitPilot,
 			in: &admissionv1beta1.AdmissionRequest{
-				Kind:      metav1.GroupVersionKind{}, // TODO
+				Kind:      metav1.GroupVersionKind{Kind: "mock"},
 				Object:    runtime.RawExtension{Raw: valid},
-				Operation: admissionv1beta1.Create,
+				Operation: admissionv1beta1.Update,
 			},
 			allowed: true,
 		},
@@ -286,7 +299,7 @@ func TestAdmitPilot(t *testing.T) {
 			name:  "unsupported operation",
 			admit: wh.admitPilot,
 			in: &admissionv1beta1.AdmissionRequest{
-				Kind:      metav1.GroupVersionKind{}, // TODO
+				Kind:      metav1.GroupVersionKind{Kind: "mock"},
 				Object:    runtime.RawExtension{Raw: valid},
 				Operation: admissionv1beta1.Delete,
 			},
@@ -296,7 +309,7 @@ func TestAdmitPilot(t *testing.T) {
 			name:  "invalid spec",
 			admit: wh.admitPilot,
 			in: &admissionv1beta1.AdmissionRequest{
-				Kind:      metav1.GroupVersionKind{}, // TODO
+				Kind:      metav1.GroupVersionKind{Kind: "mock"},
 				Object:    runtime.RawExtension{Raw: invalidConfig},
 				Operation: admissionv1beta1.Create,
 			},
@@ -306,8 +319,18 @@ func TestAdmitPilot(t *testing.T) {
 			name:  "corrupt object",
 			admit: wh.admitPilot,
 			in: &admissionv1beta1.AdmissionRequest{
-				Kind:      metav1.GroupVersionKind{}, // TODO
+				Kind:      metav1.GroupVersionKind{Kind: "mock"},
 				Object:    runtime.RawExtension{Raw: append([]byte("---"), valid...)},
+				Operation: admissionv1beta1.Create,
+			},
+			allowed: false,
+		},
+		{
+			name:  "invalid extra key create",
+			admit: wh.admitPilot,
+			in: &admissionv1beta1.AdmissionRequest{
+				Kind:      metav1.GroupVersionKind{Kind: "mock"},
+				Object:    runtime.RawExtension{Raw: extraKeyConfig},
 				Operation: admissionv1beta1.Create,
 			},
 			allowed: false,
@@ -324,13 +347,16 @@ func TestAdmitPilot(t *testing.T) {
 	}
 }
 
-func makeMixerConfig(t *testing.T, i int) []byte {
+func makeMixerConfig(t *testing.T, i int, includeBogusKey bool) []byte {
 	t.Helper()
 	uns := &unstructured.Unstructured{}
 	name := fmt.Sprintf("%s%d", "mock-config", i)
 	uns.SetName(name)
 	uns.SetKind("mock")
 	uns.Object["spec"] = map[string]interface{}{"foo": 1}
+	if includeBogusKey {
+		uns.Object["unexpected_key"] = "any value"
+	}
 	raw, err := json.Marshal(uns)
 	if err != nil {
 		t.Fatalf("Marshal(%v) failed: %v", uns, err)
@@ -339,11 +365,11 @@ func makeMixerConfig(t *testing.T, i int) []byte {
 }
 
 func TestAdmitMixer(t *testing.T) {
-	rawConfig := makeMixerConfig(t, 0)
+	rawConfig := makeMixerConfig(t, 0, false)
+	extraKeyConfig := makeMixerConfig(t, 0, true)
 	wh, cancel := createTestWebhook(
 		t,
 		fake.NewSimpleClientset(),
-		createFakeWebhookSource(),
 		createFakeEndpointsSource(),
 		dummyConfig)
 	defer cancel()
@@ -407,7 +433,7 @@ func TestAdmitMixer(t *testing.T) {
 				Operation: admissionv1beta1.Delete,
 			},
 			validator: &fakeValidator{errors.New("fail")},
-			allowed:   false,
+			allowed:   true,
 		},
 		{
 			name: "invalid delete (missing name)",
@@ -452,6 +478,17 @@ func TestAdmitMixer(t *testing.T) {
 			validator: &fakeValidator{},
 			allowed:   false,
 		},
+		{
+			name: "invalid extra key create",
+			in: &admissionv1beta1.AdmissionRequest{
+				Kind:      metav1.GroupVersionKind{Kind: "mock"},
+				Name:      "invalid extra key create",
+				Object:    runtime.RawExtension{Raw: extraKeyConfig},
+				Operation: admissionv1beta1.Create,
+			},
+			validator: &fakeValidator{},
+			allowed:   false,
+		},
 	}
 
 	for i, c := range cases {
@@ -471,7 +508,7 @@ func makeTestReview(t *testing.T, valid bool) []byte {
 		Request: &admissionv1beta1.AdmissionRequest{
 			Kind: metav1.GroupVersionKind{},
 			Object: runtime.RawExtension{
-				Raw: makePilotConfig(t, 0, valid),
+				Raw: makePilotConfig(t, 0, valid, false),
 			},
 			Operation: admissionv1beta1.Create,
 		},
@@ -483,16 +520,43 @@ func makeTestReview(t *testing.T, valid bool) []byte {
 	return reviewJSON
 }
 
+func TestServe_Basic(t *testing.T) {
+	wh, cleanup := createTestWebhook(t,
+		fake.NewSimpleClientset(),
+		createFakeEndpointsSource(),
+		dummyConfig)
+	defer cleanup()
+
+	stop := make(chan struct{})
+	ready := make(chan struct{})
+	defer func() {
+		close(stop)
+		close(ready)
+	}()
+
+	go wh.Run(ready, stop)
+
+	select {
+	case <-ready:
+		wh.Stop()
+	case <-time.After(10 * time.Second):
+		t.Fatal("The webhook serve cannot be started in 10 seconds")
+	}
+}
+
 func TestServe(t *testing.T) {
 	wh, cleanup := createTestWebhook(t,
 		fake.NewSimpleClientset(),
-		createFakeWebhookSource(),
 		createFakeEndpointsSource(),
 		dummyConfig)
 	defer cleanup()
 	stop := make(chan struct{})
-	defer func() { close(stop) }()
-	go wh.Run(stop)
+	ready := make(chan struct{})
+	defer func() {
+		close(stop)
+		close(ready)
+	}()
+	go wh.Run(ready, stop)
 
 	validReview := makeTestReview(t, true)
 	invalidReview := makeTestReview(t, false)
@@ -501,9 +565,9 @@ func TestServe(t *testing.T) {
 		name            string
 		body            []byte
 		contentType     string
-		wantAllowed     bool
 		wantStatusCode  int
-		allowedResponse bool //
+		wantAllowed     bool
+		allowedResponse bool
 	}{
 		{
 			name:            "valid",

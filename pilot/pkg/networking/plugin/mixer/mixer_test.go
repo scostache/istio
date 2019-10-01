@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright 2019 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,128 +15,117 @@
 package mixer
 
 import (
+	"reflect"
 	"testing"
+	"time"
+
+	"github.com/golang/protobuf/ptypes"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/plugin"
+	mccpb "istio.io/istio/pilot/pkg/networking/plugin/mixer/client"
+	"istio.io/istio/pkg/config/mesh"
 )
 
-func TestDisablePolicyChecks(t *testing.T) {
-	disablePolicyChecks := &plugin.InputParams{
-		ListenerProtocol: plugin.ListenerProtocolHTTP,
-		Node: &model.Proxy{
-			Type: model.Router,
-		},
-		Env: &model.Environment{
-			Mesh: &meshconfig.MeshConfig{
-				DisablePolicyChecks: true,
-			},
-		},
-	}
-
-	enablePolicyChecks := &plugin.InputParams{
-		ListenerProtocol: plugin.ListenerProtocolHTTP,
-		Node: &model.Proxy{
-			Type: model.Router,
-		},
-		Env: &model.Environment{
-			Mesh: &meshconfig.MeshConfig{
-				DisablePolicyChecks: false,
-			},
-		},
-	}
-
-	disableClientPolicyChecksParams := &plugin.InputParams{
-		ListenerProtocol: plugin.ListenerProtocolHTTP,
-		Node: &model.Proxy{
-			Type: model.Sidecar,
-		},
-		Env: &model.Environment{
-			Mesh: &meshconfig.MeshConfig{
-				EnableClientSidePolicyCheck: false,
-			},
-		},
-	}
-
-	enableClientPolicyChecks := &plugin.InputParams{
-		ListenerProtocol: plugin.ListenerProtocolHTTP,
-		Node: &model.Proxy{
-			Type: model.Sidecar,
-		},
-		Env: &model.Environment{
-			Mesh: &meshconfig.MeshConfig{
-				EnableClientSidePolicyCheck: true,
-			},
-		},
-	}
-
-	testCases := []struct {
-		name        string
-		inputParams *plugin.InputParams
-		result      bool
+func TestTransportConfig(t *testing.T) {
+	cases := []struct {
+		mesh   meshconfig.MeshConfig
+		node   model.Proxy
+		expect *mccpb.NetworkFailPolicy
 	}{
 		{
-			name:        "disable policy checks",
-			inputParams: disablePolicyChecks,
-			result:      true,
+			// defaults set
+			mesh: mesh.DefaultMeshConfig(),
+			node: model.Proxy{Metadata: &model.NodeMetadata{}},
+			expect: &mccpb.NetworkFailPolicy{
+				Policy:        mccpb.NetworkFailPolicy_FAIL_CLOSE,
+				MaxRetry:      defaultRetries,
+				BaseRetryWait: defaultBaseRetryWaitTime,
+				MaxRetryWait:  defaultMaxRetryWaitTime,
+			},
 		},
 		{
-			name:        "enable policy checks",
-			inputParams: enablePolicyChecks,
-			result:      false,
+			// retry and retry times set
+			mesh: mesh.DefaultMeshConfig(),
+			node: model.Proxy{
+				Metadata: &model.NodeMetadata{
+					PolicyCheckRetries:           "5",
+					PolicyCheckBaseRetryWaitTime: "1m",
+					PolicyCheckMaxRetryWaitTime:  "1.5s",
+				},
+			},
+			expect: &mccpb.NetworkFailPolicy{
+				Policy:        mccpb.NetworkFailPolicy_FAIL_CLOSE,
+				MaxRetry:      5,
+				BaseRetryWait: ptypes.DurationProto(1 * time.Minute),
+				MaxRetryWait:  ptypes.DurationProto(1500 * time.Millisecond),
+			},
 		},
 		{
-			name:        "disable client policy checks",
-			inputParams: disableClientPolicyChecksParams,
-			result:      true,
+			// just retry amount set
+			mesh: mesh.DefaultMeshConfig(),
+			node: model.Proxy{
+				Metadata: &model.NodeMetadata{
+					PolicyCheckRetries: "1",
+				},
+			},
+			expect: &mccpb.NetworkFailPolicy{
+				Policy:        mccpb.NetworkFailPolicy_FAIL_CLOSE,
+				MaxRetry:      1,
+				BaseRetryWait: defaultBaseRetryWaitTime,
+				MaxRetryWait:  defaultMaxRetryWaitTime,
+			},
 		},
 		{
-			name:        "enable client policy checks",
-			inputParams: enableClientPolicyChecks,
-			result:      false,
+			// fail open from node metadata
+			mesh: mesh.DefaultMeshConfig(),
+			node: model.Proxy{
+				Metadata: &model.NodeMetadata{
+					PolicyCheck: policyCheckDisable,
+				},
+			},
+			expect: &mccpb.NetworkFailPolicy{
+				Policy:        mccpb.NetworkFailPolicy_FAIL_OPEN,
+				MaxRetry:      defaultRetries,
+				BaseRetryWait: defaultBaseRetryWaitTime,
+				MaxRetryWait:  defaultMaxRetryWaitTime,
+			},
 		},
 	}
-
-	for _, tc := range testCases {
-		ret := disableClientPolicyChecks(tc.inputParams.Env.Mesh, tc.inputParams.Node)
-
-		if tc.result != ret {
-			t.Errorf("%s: expecting %v but got %v", tc.name, tc.result, ret)
+	for _, c := range cases {
+		tc := buildTransport(&c.mesh, &c.node)
+		if !reflect.DeepEqual(tc.NetworkFailPolicy, c.expect) {
+			t.Errorf("got %v, expected %v", tc.NetworkFailPolicy, c.expect)
 		}
 	}
 }
 
-func TestOnInboundListener(t *testing.T) {
-	mixerCheckServerNotPresent := &plugin.InputParams{
-		ListenerProtocol: plugin.ListenerProtocolHTTP,
-		Env: &model.Environment{
-			Mesh: &meshconfig.MeshConfig{
-				MixerCheckServer:  "",
-				MixerReportServer: "",
-			},
-		},
+func Test_proxyVersionToString(t *testing.T) {
+	type args struct {
+		ver *model.IstioVersion
 	}
-	testCases := []struct {
-		name          string
-		inputParams   *plugin.InputParams
-		mutableParams *plugin.MutableObjects
-		result        error
+	tests := []struct {
+		name string
+		args args
+		want string
 	}{
 		{
-			name:        "mixer check and report server not available",
-			inputParams: mixerCheckServerNotPresent,
-			result:      nil,
+			name: "major.minor.patch",
+			args: args{ver: &model.IstioVersion{Major: 1, Minor: 2, Patch: 0}},
+			want: "1.2.0",
+		},
+		{
+			name: "max",
+			args: args{ver: model.MaxIstioVersion},
+			want: "65535.65535.65535",
 		},
 	}
-
-	for _, tc := range testCases {
-		p := NewPlugin()
-		ret := p.OnInboundListener(tc.inputParams, tc.mutableParams)
-
-		if tc.result != ret {
-			t.Errorf("%s: expecting %v but got %v", tc.name, tc.result, ret)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := proxyVersionToString(tt.args.ver); got != tt.want {
+				t.Errorf("proxyVersionToString(ver) = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -1,18 +1,16 @@
 global:
-  controlPlaneSecurityEnabled: false
+  controlPlaneSecurityEnabled: true
 
   mtls:
     # Default setting for service-to-service mtls. Can be set explicitly using
     # destination rules or service annotations.
     enabled: true
 
-  # Default is 10s second
-  refreshInterval: 1s
-
   sds:
     enabled: true
     udsPath: "unix:/var/run/sds/uds_path"
-    useNormalJwt: true
+    token:
+      aud: "istio-ca"
 
 nodeagent:
   enabled: true
@@ -20,3 +18,4 @@ nodeagent:
   env:
     CA_PROVIDER: "Citadel"
     CA_ADDR: "istio-citadel:8060"
+    VALID_TOKEN: true

@@ -22,7 +22,7 @@ import (
 	"github.com/hashicorp/consul/api"
 
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/log"
+	"istio.io/pkg/log"
 )
 
 type consulServices map[string][]string
@@ -86,6 +86,12 @@ func (m *consulMonitor) updateServiceRecord() {
 		log.Warnf("Could not fetch services: %v", err)
 		return
 	}
+
+	// The order of service tags may change even there is no service change
+	// Sort the service tags to avoid unnecessary pushes to envoy
+	for _, tags := range svcs {
+		sort.Strings(tags)
+	}
 	newRecord := consulServices(svcs)
 	if !reflect.DeepEqual(newRecord, m.serviceCachedRecord) {
 		// This is only a work-around solution currently
@@ -93,7 +99,7 @@ func (m *consulMonitor) updateServiceRecord() {
 		// regardless of the input, thus passing in meaningless
 		// input should make functionalities work
 		//TODO
-		obj := []*api.CatalogService{}
+		var obj []*api.CatalogService
 		var event model.Event
 		for _, f := range m.serviceHandlers {
 			go func(handler ServiceHandler) {
@@ -112,15 +118,12 @@ func (m *consulMonitor) updateInstanceRecord() {
 		log.Warnf("Could not fetch instances: %v", err)
 		return
 	}
-	for _, tags := range svcs {
-		sort.Strings(tags)
-	}
 
 	instances := make([]*api.CatalogService, 0)
 	for name := range svcs {
 		endpoints, _, err := m.discovery.Catalog().Service(name, "", nil)
 		if err != nil {
-			log.Warnf("Could not retrieve service catalogue from consul: %v", err)
+			log.Warnf("Could not retrieve service catalog from consul: %v", err)
 			continue
 		}
 		instances = append(instances, endpoints...)
@@ -167,5 +170,7 @@ func (a consulServiceInstances) Swap(i, j int) {
 
 // Less i and j
 func (a consulServiceInstances) Less(i, j int) bool {
-	return a[i].ID < a[j].ID
+	// ID is the node ID
+	// ServiceID is a unique service instance identifier
+	return a[i].ID+a[i].ServiceID < a[j].ID+a[j].ServiceID
 }

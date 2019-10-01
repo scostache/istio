@@ -31,7 +31,8 @@ import (
 
 	descriptor "istio.io/api/policy/v1beta1"
 	"istio.io/istio/mixer/adapter/stackdriver/config"
-	helper "istio.io/istio/mixer/adapter/stackdriver/helper"
+	"istio.io/istio/mixer/adapter/stackdriver/helper"
+	"istio.io/istio/mixer/pkg/adapter"
 	"istio.io/istio/mixer/pkg/adapter/test"
 	metrict "istio.io/istio/mixer/template/metric"
 )
@@ -47,7 +48,7 @@ func (f *fakebuf) Record(in []*monitoringpb.TimeSeries) {
 func (*fakebuf) Close() error { return nil }
 
 var clientFunc = func(err error) createClientFunc {
-	return func(cfg *config.Params) (*monitoring.MetricClient, error) {
+	return func(cfg *config.Params, logger adapter.Logger) (*monitoring.MetricClient, error) {
 		return nil, err
 	}
 }
@@ -253,7 +254,8 @@ func TestRecord(t *testing.T) {
 	}
 	now := time.Now()
 	pbnow, _ := ptypes.TimestampProto(now)
-
+	pbend, _ := ptypes.TimestampProto(now)
+	pbend.Nanos += usec
 	tests := []struct {
 		name     string
 		vals     []*metrict.Instance
@@ -274,7 +276,7 @@ func TestRecord(t *testing.T) {
 				MetricKind: metricpb.MetricDescriptor_GAUGE,
 				ValueType:  metricpb.MetricDescriptor_INT64,
 				Points: []*monitoringpb.Point{{
-					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbnow},
+					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbend},
 					Value:    &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_Int64Value{Int64Value: int64(7)}},
 				}},
 			},
@@ -292,7 +294,7 @@ func TestRecord(t *testing.T) {
 				MetricKind: metricpb.MetricDescriptor_CUMULATIVE,
 				ValueType:  metricpb.MetricDescriptor_STRING,
 				Points: []*monitoringpb.Point{{
-					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbnow},
+					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbend},
 					Value:    &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_StringValue{StringValue: "asldkfj"}},
 				}},
 			},
@@ -310,7 +312,7 @@ func TestRecord(t *testing.T) {
 				MetricKind: metricpb.MetricDescriptor_DELTA,
 				ValueType:  metricpb.MetricDescriptor_BOOL,
 				Points: []*monitoringpb.Point{{
-					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbnow},
+					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbend},
 					Value:    &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_BoolValue{BoolValue: true}},
 				}},
 			},
@@ -328,7 +330,7 @@ func TestRecord(t *testing.T) {
 				MetricKind: metricpb.MetricDescriptor_CUMULATIVE,
 				ValueType:  metricpb.MetricDescriptor_DISTRIBUTION,
 				Points: []*monitoringpb.Point{{
-					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbnow},
+					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbend},
 					Value: &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_DistributionValue{
 						DistributionValue: &distribution.Distribution{
 							Count:         1,
@@ -351,7 +353,7 @@ func TestRecord(t *testing.T) {
 				MetricKind: metricpb.MetricDescriptor_CUMULATIVE,
 				ValueType:  metricpb.MetricDescriptor_DISTRIBUTION,
 				Points: []*monitoringpb.Point{{
-					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbnow},
+					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbend},
 					Value: &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_DistributionValue{
 						DistributionValue: &distribution.Distribution{
 							Count:         1,
@@ -374,7 +376,7 @@ func TestRecord(t *testing.T) {
 				MetricKind: metricpb.MetricDescriptor_CUMULATIVE,
 				ValueType:  metricpb.MetricDescriptor_DISTRIBUTION,
 				Points: []*monitoringpb.Point{{
-					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbnow},
+					Interval: &monitoringpb.TimeInterval{StartTime: pbnow, EndTime: pbend},
 					Value: &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_DistributionValue{
 						DistributionValue: &distribution.Distribution{
 							Count:         1,
@@ -410,7 +412,7 @@ func TestRecord(t *testing.T) {
 
 func TestProjectID(t *testing.T) {
 	createClientFn := func(pid string) createClientFunc {
-		return func(cfg *config.Params) (*monitoring.MetricClient, error) {
+		return func(cfg *config.Params, logger adapter.Logger) (*monitoring.MetricClient, error) {
 			if cfg.ProjectId != pid {
 				return nil, fmt.Errorf("wanted %v got %v", pid, cfg.ProjectId)
 			}
@@ -473,7 +475,6 @@ func TestProjectMetadata(t *testing.T) {
 			"filled",
 			[]*metrict.Instance{
 				{
-					// nolint: goimports
 					Name:                  "metric",
 					Value:                 int64(1),
 					MonitoredResourceType: "mr-type",
@@ -497,7 +498,6 @@ func TestProjectMetadata(t *testing.T) {
 			"empty",
 			[]*metrict.Instance{
 				{
-					// nolint: goimports
 					Name:                  "metric",
 					Value:                 int64(1),
 					MonitoredResourceType: "mr-type",

@@ -15,21 +15,31 @@
 package mock
 
 import (
-	"errors"
+	"istio.io/istio/galley/pkg/source/kube/client"
 
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 )
+
+var _ client.Interfaces = &Kube{}
 
 // Kube is a mock implementation of galley/pkg/common/Kube
 type Kube struct {
 	response1 []interface{}
 	response2 []error
+
+	client          kubernetes.Interface
+	APIExtClientSet *fake.Clientset
 }
 
 // NewKube returns a new instance of mock Kube.
 func NewKube() *Kube {
-	return &Kube{}
+	return &Kube{
+		client:          newKubeInterface(),
+		APIExtClientSet: fake.NewSimpleClientset(),
+	}
 }
 
 // DynamicInterface implementation.
@@ -56,7 +66,12 @@ func (k *Kube) AddResponse(r1 interface{}, r2 error) {
 	k.response2 = append(k.response2, r2)
 }
 
-// APIExtensionsClientset returns a new apiextensions clientset
+// APIExtensionsClientset implements client.Interfaces
 func (k *Kube) APIExtensionsClientset() (clientset.Interface, error) {
-	return nil, errors.New("not supported")
+	return k.APIExtClientSet, nil
+}
+
+// KubeClient implements client.Interfaces
+func (k *Kube) KubeClient() (kubernetes.Interface, error) {
+	return k.client, nil
 }

@@ -15,284 +15,83 @@
 package server
 
 import (
-	"errors"
-	"fmt"
 	"net"
-	"os"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 
-	"google.golang.org/grpc"
+	"istio.io/pkg/ctrlz/fw"
 
-	mcp "istio.io/api/mcp/v1alpha1"
-	"istio.io/istio/galley/cmd/shared"
-	"istio.io/istio/galley/pkg/fs"
-	"istio.io/istio/galley/pkg/kube"
-	"istio.io/istio/galley/pkg/kube/converter"
-	"istio.io/istio/galley/pkg/kube/source"
-	"istio.io/istio/galley/pkg/meshconfig"
-	"istio.io/istio/galley/pkg/metadata"
-	kube_meta "istio.io/istio/galley/pkg/metadata/kube"
-	"istio.io/istio/galley/pkg/runtime"
-	"istio.io/istio/pkg/ctrlz"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/mcp/creds"
-	"istio.io/istio/pkg/mcp/server"
-	"istio.io/istio/pkg/mcp/snapshot"
-	"istio.io/istio/pkg/probe"
-	"istio.io/istio/pkg/version"
+	"istio.io/istio/galley/pkg/server/components"
+	"istio.io/istio/galley/pkg/server/process"
+	"istio.io/istio/galley/pkg/server/settings"
 )
-
-var scope = log.RegisterScope("server", "Galley server debugging", 0)
 
 // Server is the main entry point into the Galley code.
 type Server struct {
-	serveWG    sync.WaitGroup
-	grpcServer *grpc.Server
-	processor  *runtime.Processor
-	mcp        *server.Server
-	reporter   server.Reporter
-	listener   net.Listener
-	controlZ   *ctrlz.Server
-	stopCh     chan struct{}
-}
+	host process.Host
 
-type patchTable struct {
-	logConfigure                func(*log.Options) error
-	newKubeFromConfigFile       func(string) (kube.Interfaces, error)
-	verifyResourceTypesPresence func(kube.Interfaces) error
-	newSource                   func(kube.Interfaces, time.Duration, *kube.Schema, *converter.Config) (runtime.Source, error)
-	netListen                   func(network, address string) (net.Listener, error)
-	newMeshConfigCache          func(path string) (meshconfig.Cache, error)
-	mcpMetricReporter           func(string) server.Reporter
-	fsNew                       func(string, *kube.Schema, *converter.Config) (runtime.Source, error)
-}
-
-func defaultPatchTable() patchTable {
-	return patchTable{
-		logConfigure:                log.Configure,
-		newKubeFromConfigFile:       kube.NewKubeFromConfigFile,
-		verifyResourceTypesPresence: source.VerifyResourceTypesPresence,
-		newSource:                   source.New,
-		netListen:                   net.Listen,
-		mcpMetricReporter:           func(prefix string) server.Reporter { return server.NewStatsContext(prefix) },
-		newMeshConfigCache:          func(path string) (meshconfig.Cache, error) { return meshconfig.NewCacheFromFile(path) },
-		fsNew:                       fs.New,
-	}
+	p  *components.Processing
+	p2 *components.Processing2
 }
 
 // New returns a new instance of a Server.
-func New(a *Args) (*Server, error) {
-	var convertK8SService bool
-	if s := os.Getenv("ISTIO_CONVERT_K8S_SERVICE"); s != "" {
-		b, err := strconv.ParseBool(s)
-		if err != nil {
-			return nil, err
-		}
-		convertK8SService = b
-	}
-	return newServer(a, defaultPatchTable(), convertK8SService)
-}
-
-func newServer(a *Args, p patchTable, convertK8SService bool) (*Server, error) {
-	var err error
+func New(a *settings.Args) *Server {
 	s := &Server{}
 
-	defer func() {
-		// If returns with error, need to close the server.
-		if err != nil {
-			_ = s.Close()
-		}
-	}()
+	var topics []fw.Topic
 
-	if err = p.logConfigure(a.LoggingOptions); err != nil {
-		return nil, err
+	liveness := components.NewProbe(&a.Liveness)
+	s.host.Add(liveness)
+
+	readiness := components.NewProbe(&a.Readiness)
+	s.host.Add(readiness)
+
+	if a.ValidationArgs != nil && a.ValidationArgs.EnableValidation {
+		validation := components.NewValidation(a.KubeConfig, a.ValidationArgs, liveness.Controller(), readiness.Controller())
+		s.host.Add(validation)
 	}
 
-	mesh, err := p.newMeshConfigCache(a.MeshConfigFile)
-	if err != nil {
-		return nil, err
-	}
-	converterCfg := &converter.Config{
-		Mesh:         mesh,
-		DomainSuffix: a.DomainSuffix,
-	}
-	specs := kube_meta.Types.All()
-	if !convertK8SService {
-		var filtered []kube.ResourceSpec
-		for _, t := range specs {
-			if t.Kind != "Service" {
-				filtered = append(filtered, t)
-			}
-		}
-		specs = filtered
-	}
-	sort.Slice(specs, func(i, j int) bool {
-		return strings.Compare(specs[i].CanonicalResourceName(), specs[j].CanonicalResourceName()) < 0
-	})
-	sb := kube.NewSchemaBuilder()
-	for _, s := range specs {
-		sb.Add(s)
-	}
-	schema := sb.Build()
-
-	var src runtime.Source
-	if a.ConfigPath != "" {
-		src, err = p.fsNew(a.ConfigPath, schema, converterCfg)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		k, err := p.newKubeFromConfigFile(a.KubeConfig)
-		if err != nil {
-			return nil, err
-		}
-		if !a.DisableResourceReadyCheck {
-			if err := p.verifyResourceTypesPresence(k); err != nil {
-				return nil, err
-			}
-		}
-		src, err = p.newSource(k, a.ResyncPeriod, schema, converterCfg)
-		if err != nil {
-			return nil, err
+	if a.EnableServer {
+		if a.UseOldProcessor {
+			s.p = components.NewProcessing(a)
+			s.host.Add(s.p)
+			t := s.p.ConfigZTopic()
+			topics = append(topics, t)
+		} else {
+			s.p2 = components.NewProcessing2(a)
+			s.host.Add(s.p2)
+			t := s.p2.ConfigZTopic()
+			topics = append(topics, t)
 		}
 	}
 
-	processorCfg := runtime.Config{
-		DomainSuffix: a.DomainSuffix,
-		Mesh:         mesh,
-	}
-	distributor := snapshot.New(snapshot.DefaultGroupIndex)
-	s.processor = runtime.NewProcessor(src, distributor, &processorCfg)
+	mon := components.NewMonitoring(a.MonitoringPort)
+	s.host.Add(mon)
 
-	var grpcOptions []grpc.ServerOption
-	grpcOptions = append(grpcOptions, grpc.MaxConcurrentStreams(uint32(a.MaxConcurrentStreams)))
-	grpcOptions = append(grpcOptions, grpc.MaxRecvMsgSize(int(a.MaxReceivedMessageSize)))
-
-	s.stopCh = make(chan struct{})
-	checker := server.NewAllowAllChecker()
-	if !a.Insecure {
-		checker, err = watchAccessList(s.stopCh, a.AccessListFile)
-		if err != nil {
-			return nil, err
-		}
-
-		watcher, err := creds.PollFiles(s.stopCh, a.CredentialOptions)
-		if err != nil {
-			return nil, err
-		}
-		credentials := creds.CreateForServer(watcher)
-
-		grpcOptions = append(grpcOptions, grpc.Creds(credentials))
-	}
-	grpc.EnableTracing = a.EnableGRPCTracing
-	s.grpcServer = grpc.NewServer(grpcOptions...)
-
-	s.reporter = p.mcpMetricReporter("galley/")
-	s.mcp = server.New(distributor, metadata.Types.TypeURLs(), checker, s.reporter)
-
-	// get the network stuff setup
-	network := "tcp"
-	var address string
-	idx := strings.Index(a.APIAddress, "://")
-	if idx < 0 {
-		address = a.APIAddress
-	} else {
-		network = a.APIAddress[:idx]
-		address = a.APIAddress[idx+3:]
+	if a.EnableProfiling {
+		prof := components.NewProfiling(a.PprofPort)
+		s.host.Add(prof)
 	}
 
-	if s.listener, err = p.netListen(network, address); err != nil {
-		return nil, fmt.Errorf("unable to listen: %v", err)
-	}
+	clz := components.NewCtrlz(a.IntrospectionOptions, topics...)
+	s.host.Add(clz)
 
-	mcp.RegisterAggregatedMeshConfigServiceServer(s.grpcServer, s.mcp)
-
-	s.controlZ, _ = ctrlz.Run(a.IntrospectionOptions, nil)
-
-	return s, nil
+	return s
 }
 
-// Run enables Galley to start receiving gRPC requests on its main API port.
-func (s *Server) Run() {
-	s.serveWG.Add(1)
-	go func() {
-		defer s.serveWG.Done()
-		err := s.processor.Start()
-		if err != nil {
-			scope.Fatalf("Galley Server unexpectedly terminated: %v", err)
-			return
-		}
+// Address returns the address of the config processing server.
+func (s *Server) Address() net.Addr {
+	if s.p != nil {
+		return s.p.Address()
+	}
+	return s.p2.Address()
 
-		// start serving
-		err = s.grpcServer.Serve(s.listener)
-		if err != nil {
-			scope.Fatalf("Galley Server unexpectedly terminated: %v", err)
-		}
-	}()
 }
 
-// Close cleans up resources used by the server.
-func (s *Server) Close() error {
-	if s.stopCh != nil {
-		close(s.stopCh)
-		s.stopCh = nil
-	}
-
-	if s.grpcServer != nil {
-		s.grpcServer.GracefulStop()
-		s.serveWG.Wait()
-	}
-
-	if s.controlZ != nil {
-		s.controlZ.Close()
-	}
-
-	if s.processor != nil {
-		s.processor.Stop()
-	}
-
-	if s.listener != nil {
-		_ = s.listener.Close()
-	}
-
-	if s.reporter != nil {
-		_ = s.reporter.Close()
-	}
-
-	// final attempt to purge buffered logs
-	_ = log.Sync()
-
-	return nil
+// Start the process.
+func (s *Server) Start() error {
+	return s.host.Start()
 }
 
-//RunServer start Galley Server mode
-func RunServer(sa *Args, printf, fatalf shared.FormatFn, livenessProbeController,
-	readinessProbeController probe.Controller) {
-	printf("Galley started with\n%s", sa)
-	s, err := New(sa)
-	if err != nil {
-		fatalf("Unable to initialize Galley Server: %v", err)
-	}
-	printf("Istio Galley: %s", version.Info)
-	printf("Starting gRPC server on %v", sa.APIAddress)
-	s.Run()
-	if livenessProbeController != nil {
-		serverLivenessProbe := probe.NewProbe()
-		serverLivenessProbe.SetAvailable(nil)
-		serverLivenessProbe.RegisterProbe(livenessProbeController, "serverLiveness")
-		defer serverLivenessProbe.SetAvailable(errors.New("stopped"))
-	}
-	if readinessProbeController != nil {
-		serverReadinessProbe := probe.NewProbe()
-		serverReadinessProbe.SetAvailable(nil)
-		serverReadinessProbe.RegisterProbe(readinessProbeController, "serverReadiness")
-		defer serverReadinessProbe.SetAvailable(errors.New("stopped"))
-	}
-
-	s.serveWG.Wait()
-	_ = s.Close()
+// Stop cleans up resources used by the server.
+func (s *Server) Stop() {
+	s.host.Stop()
 }

@@ -54,19 +54,13 @@ func (p *pollingWatcher) certPool() *x509.CertPool {
 	return p.caCertPool
 }
 
-// PollFolder loads certificates from the given folder. It expects the
-// following files:
-// cert-chain.pem, key.pem: Certificate/key files for the client/server on this side.
-// root-cert.pem: certificate from the CA that will be used for validating peer's certificate.
-//
-// Internally PollFolder will call PollFiles.
-func PollFolder(stop <-chan struct{}, folder string) (CertificateWatcher, error) {
+func pollFolder(stop <-chan struct{}, folder string, interval time.Duration) (CertificateWatcher, error) {
 	cred := &Options{
 		CertificateFile:   path.Join(folder, defaultCertificateFile),
 		KeyFile:           path.Join(folder, defaultKeyFile),
 		CACertificateFile: path.Join(folder, defaultCACertificateFile),
 	}
-	return PollFiles(stop, cred)
+	return pollFiles(stop, cred, interval)
 }
 
 // PollFiles loads certificate & key files from the file system. The method will start a background

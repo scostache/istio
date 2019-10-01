@@ -18,25 +18,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	"github.com/onsi/gomega"
 
-	mcp "istio.io/api/mcp/v1alpha1"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pkg/config/schemas"
+
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
+
 	mixerEnv "istio.io/istio/mixer/test/client/env"
 	"istio.io/istio/pilot/pkg/bootstrap"
-	"istio.io/istio/pilot/pkg/model"
-	mcpserver "istio.io/istio/pkg/mcp/server"
+	srmemory "istio.io/istio/pilot/pkg/serviceregistry/memory"
+	"istio.io/istio/pkg/mcp/snapshot"
+	"istio.io/istio/pkg/mcp/source"
+	mcptesting "istio.io/istio/pkg/mcp/testing"
+	"istio.io/istio/pkg/mcp/testing/groups"
 	"istio.io/istio/pkg/test/env"
-	mockmcp "istio.io/istio/tests/e2e/tests/pilot/mock/mcp"
 	"istio.io/istio/tests/util"
 )
 
@@ -55,7 +61,12 @@ const (
 	app1ListenPort  = 61005
 	app2ListenPort  = 61006
 	app3ListenPort  = 6868
+
+	ingressGatewaySvc = "cloudfoundry-ingress.istio-system.svc.cluster.local"
 )
+
+var gatewaySvc = srmemory.MakeService(ingressGatewaySvc, "11.0.0.1")
+var gatewayInstance = srmemory.MakeIP(gatewaySvc, 0)
 
 func pilotURL(path string) string {
 	return (&url.URL{
@@ -65,7 +76,7 @@ func pilotURL(path string) string {
 	}).String()
 }
 
-var fakeCreateTime *types.Timestamp
+var fakeCreateTime2 = time.Date(2018, time.January, 1, 2, 3, 4, 5, time.UTC)
 
 func TestWildcardHostEdgeRouterWithMockCopilot(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
@@ -78,12 +89,37 @@ func TestWildcardHostEdgeRouterWithMockCopilot(t *testing.T) {
 
 	t.Log("starting mock copilot grpc server...")
 	var err error
-	fakeCreateTime, err = types.TimestampProto(time.Date(2018, time.January, 1, 12, 15, 30, 5e8, time.UTC))
+	_, err = types.TimestampProto(time.Date(2018, time.January, 1, 12, 15, 30, 5e8, time.UTC))
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
-	copilotMCPServer, err := startMCPCopilot(mcpServerResponse)
+	copilotMCPServer, err := startMCPCopilot()
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	defer copilotMCPServer.Close()
+
+	sn := snapshot.NewInMemoryBuilder()
+
+	for _, m := range schemas.Istio {
+		sn.SetVersion(m.Collection, "v0")
+	}
+
+	sn.SetEntry(schemas.Gateway.Collection, "cloudfoundry-ingress", "v1", fakeCreateTime2, nil, nil, gateway)
+
+	sn.SetEntry(schemas.VirtualService.Collection, "vs-1", "v1", fakeCreateTime2, nil, nil,
+		virtualService(8060, "cloudfoundry-ingress", "/some/path", cfRouteOne, subsetOne))
+	sn.SetEntry(schemas.VirtualService.Collection, "vs-2", "v1", fakeCreateTime2, nil, nil,
+		virtualService(8070, "cloudfoundry-ingress", "", cfRouteTwo, subsetTwo))
+
+	sn.SetEntry(schemas.DestinationRule.Collection, "dr-1", "v1", fakeCreateTime2, nil, nil,
+		destinationRule(cfRouteOne, subsetOne))
+	sn.SetEntry(schemas.DestinationRule.Collection, "dr-2", "v1", fakeCreateTime2, nil, nil,
+		destinationRule(cfRouteTwo, subsetTwo))
+
+	sn.SetEntry(schemas.ServiceEntry.Collection, "se-1", "v1", fakeCreateTime2, nil, nil,
+		serviceEntry(8060, app1ListenPort, nil, cfRouteOne, subsetOne))
+	sn.SetEntry(schemas.ServiceEntry.Collection, "se-2", "v1", fakeCreateTime2, nil, nil,
+		serviceEntry(8070, app2ListenPort, nil, cfRouteTwo, subsetTwo))
+
+	copilotMCPServer.Cache.SetSnapshot(groups.Default, sn.Build())
 
 	tearDown := initLocalPilotTestEnv(t, copilotMCPServer.Port, pilotGrpcPort, pilotDebugPort)
 	defer tearDown()
@@ -102,7 +138,7 @@ func TestWildcardHostEdgeRouterWithMockCopilot(t *testing.T) {
 	}).Should(gomega.ContainSubstring("gateway"))
 
 	t.Log("run edge router envoy...")
-	gateway := runEnvoy(t, "router~x~x~x", pilotGrpcPort, pilotDebugPort)
+	gateway := runEnvoy(t, "router~"+gatewayInstance+"~x~x", pilotGrpcPort, pilotDebugPort)
 	defer gateway.TearDown()
 
 	t.Log("curling the app with expected host header")
@@ -157,14 +193,26 @@ func TestWildcardHostEdgeRouterWithMockCopilot(t *testing.T) {
 }
 
 func TestWildcardHostSidecarRouterWithMockCopilot(t *testing.T) {
+	curEnv := features.RestrictPodIPTrafficLoops.Get()
+	os.Setenv(features.RestrictPodIPTrafficLoops.Name, "false")
+	defer os.Setenv(features.RestrictPodIPTrafficLoops.Name, strconv.FormatBool(curEnv))
+
 	g := gomega.NewGomegaWithT(t)
 
 	runFakeApp(app3ListenPort)
 	t.Logf("internal backend is running on port %d", app3ListenPort)
 
-	copilotMCPServer, err := startMCPCopilot(mcpSidecarServerResponse)
+	copilotMCPServer, err := startMCPCopilot()
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	defer copilotMCPServer.Close()
+
+	sn := snapshot.NewInMemoryBuilder()
+	for _, m := range schemas.Istio {
+		sn.SetVersion(m.Collection, "v0")
+	}
+	sn.SetEntry(schemas.ServiceEntry.Collection, "se-1", "v1", fakeCreateTime2, nil, nil,
+		serviceEntry(sidecarServicePort, app3ListenPort, []string{"127.1.1.1"}, cfInternalRoute, subsetOne))
+	copilotMCPServer.Cache.SetSnapshot(groups.Default, sn.Build())
 
 	tearDown := initLocalPilotTestEnv(t, copilotMCPServer.Port, pilotGrpcPort, pilotDebugPort)
 	defer tearDown()
@@ -205,13 +253,13 @@ func TestWildcardHostSidecarRouterWithMockCopilot(t *testing.T) {
 	}, "300s", "1s").Should(gomega.Succeed())
 }
 
-func startMCPCopilot(serverResponse func(req *mcp.MeshConfigRequest) (*mcpserver.WatchResponse, mcpserver.CancelWatchFunc)) (*mockmcp.Server, error) {
-	supportedTypes := make([]string, len(model.IstioConfigTypes))
-	for i, m := range model.IstioConfigTypes {
-		supportedTypes[i] = fmt.Sprintf("type.googleapis.com/%s", m.MessageName)
+func startMCPCopilot() (*mcptesting.Server, error) {
+	collections := make([]string, len(schemas.Istio))
+	for i, m := range schemas.Istio {
+		collections[i] = m.Collection
 	}
 
-	server, err := mockmcp.NewServer(supportedTypes, serverResponse)
+	server, err := mcptesting.NewServer(0, source.CollectionOptionsFromSlice(collections))
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +281,12 @@ func runFakeApp(port int) {
 
 func addMcpAddrs(mcpServerPort int) func(*bootstrap.PilotArgs) {
 	return func(arg *bootstrap.PilotArgs) {
-		arg.MCPServerAddrs = []string{fmt.Sprintf("mcp://127.0.0.1:%d", mcpServerPort)}
+		if arg.MeshConfig == nil {
+			arg.MeshConfig = &meshconfig.MeshConfig{}
+		}
+		arg.MeshConfig.ConfigSources = []*meshconfig.ConfigSource{
+			{Address: fmt.Sprintf("127.0.0.1:%d", mcpServerPort)},
+		}
 	}
 }
 
@@ -253,8 +306,8 @@ func initLocalPilotTestEnv(t *testing.T, mcpPort, grpcPort, debugPort int) util.
 	mixerEnv.NewTestSetup(mixerEnv.PilotMCPTest, t)
 	debugAddr := fmt.Sprintf("127.0.0.1:%d", debugPort)
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", grpcPort)
-	_, tearDown := util.EnsureTestServer(addMcpAddrs(mcpPort), setupPilotDiscoveryHTTPAddr(debugAddr), setupPilotDiscoveryGrpcAddr(grpcAddr))
-	return tearDown
+	_, teardown := util.EnsureTestServer(addMcpAddrs(mcpPort), setupPilotDiscoveryHTTPAddr(debugAddr), setupPilotDiscoveryGrpcAddr(grpcAddr))
+	return teardown
 }
 
 func runEnvoy(t *testing.T, nodeID string, grpcPort, debugPort uint16) *mixerEnv.TestSetup {
@@ -319,97 +372,9 @@ func curlApp(endpoint, hostRoute url.URL) (string, error) {
 	return string(respBytes), nil
 }
 
-var gatewayTestAllConfig = map[string]map[string]proto.Message{
-	fmt.Sprintf("type.googleapis.com/%s", model.Gateway.MessageName): map[string]proto.Message{
-		"cloudfoundry-ingress": gateway,
-	},
-
-	fmt.Sprintf("type.googleapis.com/%s", model.VirtualService.MessageName): map[string]proto.Message{
-		"vs-1": virtualService(8060, "cloudfoundry-ingress", "/some/path", cfRouteOne, subsetOne),
-		"vs-2": virtualService(8070, "cloudfoundry-ingress", "", cfRouteTwo, subsetTwo),
-	},
-
-	fmt.Sprintf("type.googleapis.com/%s", model.DestinationRule.MessageName): map[string]proto.Message{
-		"dr-1": destinationRule(cfRouteOne, subsetOne),
-		"dr-2": destinationRule(cfRouteTwo, subsetTwo),
-	},
-
-	fmt.Sprintf("type.googleapis.com/%s", model.ServiceEntry.MessageName): map[string]proto.Message{
-		"se-1": serviceEntry(8060, app1ListenPort, nil, cfRouteOne, subsetOne),
-		"se-2": serviceEntry(8070, app2ListenPort, nil, cfRouteTwo, subsetTwo),
-	},
-}
-
-var sidecarTestAllConfig = map[string]map[string]proto.Message{
-	fmt.Sprintf("type.googleapis.com/%s", model.ServiceEntry.MessageName): map[string]proto.Message{
-		"se-1": serviceEntry(sidecarServicePort, app3ListenPort, []string{"127.1.1.1"}, cfInternalRoute, subsetOne),
-	},
-}
-
-func mcpSidecarServerResponse(req *mcp.MeshConfigRequest) (*mcpserver.WatchResponse, mcpserver.CancelWatchFunc) {
-	var cancelFunc mcpserver.CancelWatchFunc
-	cancelFunc = func() {
-		log.Printf("watch canceled for %s\n", req.GetTypeUrl())
-	}
-
-	namedMsgs, ok := sidecarTestAllConfig[req.GetTypeUrl()]
-	if ok {
-		return buildWatchResp(req, namedMsgs), cancelFunc
-	}
-
-	return &mcpserver.WatchResponse{
-		Version:   req.GetVersionInfo(),
-		TypeURL:   req.GetTypeUrl(),
-		Envelopes: []*mcp.Envelope{},
-	}, cancelFunc
-}
-
-func mcpServerResponse(req *mcp.MeshConfigRequest) (*mcpserver.WatchResponse, mcpserver.CancelWatchFunc) {
-	var cancelFunc mcpserver.CancelWatchFunc
-	cancelFunc = func() {
-		log.Printf("watch canceled for %s\n", req.GetTypeUrl())
-	}
-
-	namedMsgs, ok := gatewayTestAllConfig[req.GetTypeUrl()]
-	if ok {
-		return buildWatchResp(req, namedMsgs), cancelFunc
-	}
-
-	return &mcpserver.WatchResponse{
-		Version:   req.GetVersionInfo(),
-		TypeURL:   req.GetTypeUrl(),
-		Envelopes: []*mcp.Envelope{},
-	}, cancelFunc
-}
-
-func buildWatchResp(req *mcp.MeshConfigRequest, namedMsgs map[string]proto.Message) *mcpserver.WatchResponse {
-	envelopes := []*mcp.Envelope{}
-	for name, msg := range namedMsgs {
-		marshaledMsg, err := proto.Marshal(msg)
-		if err != nil {
-			log.Fatalf("marshaling %s: %s\n", name, err)
-		}
-		envelopes = append(envelopes, &mcp.Envelope{
-			Metadata: &mcp.Metadata{
-				Name:       name,
-				CreateTime: fakeCreateTime,
-			},
-			Resource: &types.Any{
-				TypeUrl: req.GetTypeUrl(),
-				Value:   marshaledMsg,
-			},
-		})
-	}
-	return &mcpserver.WatchResponse{
-		Version:   req.GetVersionInfo(),
-		TypeURL:   req.GetTypeUrl(),
-		Envelopes: envelopes,
-	}
-}
-
 var gateway = &networking.Gateway{
 	Servers: []*networking.Server{
-		&networking.Server{
+		{
 			Port: &networking.Port{
 				Name:     "http",
 				Number:   publicPort,

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright 2019 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ type Distributor interface {
 
 // InMemoryDistributor is an in-memory distributor implementation.
 type InMemoryDistributor struct {
-	snapshotsLock sync.Mutex
+	snapshotsLock sync.RWMutex
 	snapshots     map[string]sn.Snapshot
 	listenersLock sync.Mutex
 	listeners     []*listenerEntry
@@ -73,12 +73,19 @@ func (d *InMemoryDistributor) ClearSnapshot(name string) {
 
 // GetSnapshot get the snapshot of the specified name
 func (d *InMemoryDistributor) GetSnapshot(name string) sn.Snapshot {
-	d.snapshotsLock.Lock()
-	defer d.snapshotsLock.Unlock()
+	d.snapshotsLock.RLock()
+	defer d.snapshotsLock.RUnlock()
 	if s, ok := d.snapshots[name]; ok {
 		return s
 	}
 	return nil
+}
+
+// NumSnapshots returns the current number of snapshots.
+func (d *InMemoryDistributor) NumSnapshots() int {
+	d.snapshotsLock.RLock()
+	defer d.snapshotsLock.RUnlock()
+	return len(d.snapshots)
 }
 
 // ListenChanges registered listener and start listening snapshot changes in the distributor
@@ -117,7 +124,6 @@ func (d *InMemoryDistributor) deleteListener(l *listenerEntry) {
 	for i := len(d.listeners) - 1; i >= 0; i-- {
 		if d.listeners[i] == l {
 			d.listeners = append(d.listeners[:i], d.listeners[i+1:]...)
-			l = nil
 			return
 		}
 	}

@@ -21,6 +21,8 @@ import (
 	"io/ioutil"
 	"os"
 
+	"istio.io/istio/pkg/spiffe"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
@@ -91,7 +93,7 @@ func (ci *OnPremClientImpl) GetServiceIdentity() (string, error) {
 	}
 	if len(serviceIDs) != 1 {
 		for _, s := range serviceIDs {
-			if strings.HasPrefix(s, "spiffe://") {
+			if strings.HasPrefix(s, spiffe.URIPrefix) {
 				return s, nil
 			}
 		}
@@ -116,6 +118,9 @@ func (ci *OnPremClientImpl) GetCredentialType() string {
 
 // getTLSCredentials creates transport credentials that are common to
 // node agent and CA.
+// rootCertFile: the root certificate to authenticate the other end.
+// keyFile: the private key for itself to get authenticated.
+// certChainFile: the leaf cert + intermediate certs for itself to get authenticated.
 func getTLSCredentials(rootCertFile, keyFile, certChainFile string) (credentials.TransportCredentials, error) {
 
 	// Load the certificate from disk

@@ -28,9 +28,10 @@ import (
 
 	"k8s.io/client-go/tools/clientcmd"
 
-	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/security/pkg/k8s/controller"
 	"istio.io/istio/security/pkg/pki/util"
+	"istio.io/pkg/log"
 )
 
 var (
@@ -348,7 +349,7 @@ func ExamineSecret(secret *v1.Secret) error {
 		}
 	}
 
-	expectedID, err := util.GenSanURI(secret.GetNamespace(), "default")
+	expectedID, err := spiffe.GenSpiffeURI(secret.GetNamespace(), "default")
 	if err != nil {
 		return err
 	}

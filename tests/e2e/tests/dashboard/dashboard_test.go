@@ -35,20 +35,21 @@ import (
 	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/periodic"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test/kube"
 	"istio.io/istio/tests/e2e/framework"
 	"istio.io/istio/tests/util"
+	"istio.io/pkg/log"
 )
 
 const (
-	istioMeshDashboard   = "install/kubernetes/helm/subcharts/grafana/dashboards/istio-mesh-dashboard.json"
-	serviceDashboard     = "install/kubernetes/helm/subcharts/grafana/dashboards/istio-service-dashboard.json"
-	workloadDashboard    = "install/kubernetes/helm/subcharts/grafana/dashboards/istio-workload-dashboard.json"
-	performanceDashboard = "install/kubernetes/helm/subcharts/grafana/dashboards/istio-performance-dashboard.json"
-	mixerDashboard       = "install/kubernetes/helm/subcharts/grafana/dashboards/mixer-dashboard.json"
-	pilotDashboard       = "install/kubernetes/helm/subcharts/grafana/dashboards/pilot-dashboard.json"
-	galleyDashboard      = "install/kubernetes/helm/subcharts/grafana/dashboards/galley-dashboard.json"
+	istioMeshDashboard   = "install/kubernetes/helm/istio/charts/grafana/dashboards/istio-mesh-dashboard.json"
+	serviceDashboard     = "install/kubernetes/helm/istio/charts/grafana/dashboards/istio-service-dashboard.json"
+	workloadDashboard    = "install/kubernetes/helm/istio/charts/grafana/dashboards/istio-workload-dashboard.json"
+	performanceDashboard = "install/kubernetes/helm/istio/charts/grafana/dashboards/istio-performance-dashboard.json"
+	mixerDashboard       = "install/kubernetes/helm/istio/charts/grafana/dashboards/mixer-dashboard.json"
+	pilotDashboard       = "install/kubernetes/helm/istio/charts/grafana/dashboards/pilot-dashboard.json"
+	galleyDashboard      = "install/kubernetes/helm/istio/charts/grafana/dashboards/galley-dashboard.json"
+	citadelDashboard     = "install/kubernetes/helm/istio/charts/grafana/dashboards/citadel-dashboard.json"
 	fortioYaml           = "tests/e2e/tests/dashboard/fortio-rules.yaml"
 	netcatYaml           = "tests/e2e/tests/dashboard/netcat-rules.yaml"
 
@@ -136,9 +137,10 @@ func TestDashboards(t *testing.T) {
 		{"Istio", istioMeshDashboard, func(queries []string) []string { return queries }, nil, "istio-telemetry", 42422},
 		{"Service", serviceDashboard, func(queries []string) []string { return queries }, nil, "istio-telemetry", 42422},
 		{"Workload", workloadDashboard, func(queries []string) []string { return queries }, workloadReplacer, "istio-telemetry", 42422},
-		{"Mixer", mixerDashboard, mixerQueryFilterFn, nil, "istio-telemetry", 9093},
-		{"Pilot", pilotDashboard, pilotQueryFilterFn, nil, "istio-pilot", 9093},
-		{"Galley", galleyDashboard, galleyQueryFilterFn, nil, "istio-galley", 9093},
+		{"Citadel", citadelDashboard, citadelQueryFilterFn, nil, "istio-citadel", 15014},
+		{"Mixer", mixerDashboard, mixerQueryFilterFn, nil, "istio-telemetry", 15014},
+		{"Pilot", pilotDashboard, pilotQueryFilterFn, nil, "istio-pilot", 15014},
+		{"Galley", galleyDashboard, galleyQueryFilterFn, nil, "istio-galley", 15014},
 		{"Performance", performanceDashboard, performanceQueryFilterFn, nil, "istio-telemetry", 42422},
 	}
 
@@ -302,7 +304,25 @@ func pilotQueryFilterFn(queries []string) []string {
 		if strings.Contains(query, "pilot_xds_push_errors") {
 			continue
 		}
+		if strings.Contains(query, "pilot_total_xds_internal_errors") {
+			continue
+		}
+		if strings.Contains(query, "pilot_xds_push_context_errors") {
+			continue
+		}
+		if strings.Contains(query, `pilot_xds_pushes{type!~\"lds|cds|rds|eds\"}`) {
+			continue
+		}
+		if strings.Contains(query, "pilot_xds_eds_instances") {
+			continue
+		}
 		if strings.Contains(query, "_reject") {
+			continue
+		}
+		if strings.Contains(query, "_timeout") {
+			continue
+		}
+		if strings.Contains(query, "_virt_services") {
 			continue
 		}
 		filtered = append(filtered, query)
@@ -322,7 +342,7 @@ func galleyQueryFilterFn(queries []string) []string {
 		if strings.Contains(query, "validation_http_error") {
 			continue
 		}
-		if strings.Contains(query, "handle_event_error_total") {
+		if strings.Contains(query, "event_error_total") {
 			continue
 		}
 		if strings.Contains(query, "converter_failure_total") {
@@ -338,6 +358,48 @@ func galleyQueryFilterFn(queries []string) []string {
 			continue
 		}
 		if strings.Contains(query, "request_acks_total") {
+			continue
+		}
+		// This is a frequent source of flakes in e2e-dashboard test. Remove from checked queries for now.
+		if strings.Contains(query, "runtime_strategy_timer_quiesce_reached_total") {
+			continue
+		}
+
+		// Remove this one, as firing of this event requires a hard-to-reproduce set of events.
+		if strings.Contains(query, "runtime_strategy_timer_max_time_reached_total") {
+			continue
+		}
+		filtered = append(filtered, query)
+	}
+	return filtered
+}
+
+func citadelQueryFilterFn(queries []string) []string {
+	filtered := make([]string, 0, len(queries))
+	for _, query := range queries {
+		if strings.Contains(query, "csr_err_count") {
+			continue
+		}
+		if strings.Contains(query, "svc_acc_created_cert_count") {
+			continue
+		}
+		if strings.Contains(query, "acc_deleted_cert_count") {
+			continue
+		}
+		if strings.Contains(query, "secret_deleted_cert_count") {
+			continue
+		}
+		if strings.Contains(query, "server_csr_count") {
+			continue
+		}
+
+		if strings.Contains(query, "success_cert_issuance_count") {
+			continue
+		}
+		if strings.Contains(query, "csr_parsing_err_count") {
+			continue
+		}
+		if strings.Contains(query, "authentication_failure_count") {
 			continue
 		}
 		filtered = append(filtered, query)
@@ -447,16 +509,17 @@ func newPromProxy(namespace string) *promProxy {
 
 func (p *promProxy) portForward(labelSelector string, localPort uint16, remotePort uint16) error {
 	log.Infof("Setting up %s proxy", labelSelector)
-	options := &kube.PodSelectOptions{
-		PodNamespace:  p.namespace,
-		LabelSelector: labelSelector,
-	}
+
 	accessor, err := kube.NewAccessor(tc.Kube.KubeConfig, "")
 	if err != nil {
 		log.Errorf("Error creating accessor: %v", err)
 		return err
 	}
-	forwarder, err := accessor.NewPortForwarder(options, localPort, remotePort)
+	pod, err := accessor.FindPodBySelectors(p.namespace, labelSelector)
+	if err != nil {
+		log.Errorf("error finding pod: %v", err)
+	}
+	forwarder, err := accessor.NewPortForwarder(pod, localPort, remotePort)
 	if err != nil {
 		log.Errorf("Error creating port forwarder: %v", err)
 		return err
@@ -540,18 +603,17 @@ func waitForMixerProxyReadiness() error {
 		log.Infof("Waiting for Mixer's proxy to be ready to dispatch traffic: %v", duration)
 		time.Sleep(duration)
 
-		for _, pod := range mixerPods {
-			options := &kube.PodSelectOptions{
-				PodNamespace: tc.Kube.Namespace,
-				PodName:      pod,
-			}
-
+		for _, podName := range mixerPods {
 			accessor, err := kube.NewAccessor(tc.Kube.KubeConfig, "")
 			if err != nil {
 				log.Errorf("Error creating accessor: %v", err)
 				return err
 			}
-			forwarder, err := accessor.NewPortForwarder(options, 16000, 15000)
+			pod, err := accessor.GetPod(tc.Kube.Namespace, podName)
+			if err != nil {
+				log.Errorf("error retrieving pod: %v", err)
+			}
+			forwarder, err := accessor.NewPortForwarder(pod, 16000, 15000)
 			if err != nil {
 				log.Infof("Error creating port forwarder: %v", err)
 				continue
@@ -565,7 +627,7 @@ func waitForMixerProxyReadiness() error {
 			forwarder.Close()
 
 			if err != nil {
-				log.Infof("Failure retrieving status for pod %s (container: istio-proxy): %v", pod, err)
+				log.Infof("Failure retrieving status for pod %v (container: istio-proxy): %v", pod, err)
 				continue
 			}
 
@@ -573,7 +635,7 @@ func waitForMixerProxyReadiness() error {
 				return nil
 			}
 
-			log.Infof("Failure retrieving status for pod %s (container: istio-proxy) status code should be 200 got: %d", pod, resp.StatusCode)
+			log.Infof("Failure retrieving status for pod %v (container: istio-proxy) status code should be 200 got: %d", pod, resp.StatusCode)
 		}
 	}
 	return errors.New("proxy for mixer never started main dispatch loop")
